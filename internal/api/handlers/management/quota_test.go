@@ -3,6 +3,7 @@ package management
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -130,5 +131,152 @@ func TestResetQuota_DoesNotAcceptAuthIDOrFileName(t *testing.T) {
 				t.Fatalf("status = %d, want %d with body %s", rec.Code, tt.wantCode, rec.Body.String())
 			}
 		})
+	}
+}
+
+func TestResetModelCooldown_ClearsOnlyRequestedModel(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	updatedAt := time.Now().Add(-time.Minute).UTC()
+	observedAt := updatedAt.Add(time.Second)
+	next := time.Now().Add(time.Hour)
+	auth := &coreauth.Auth{
+		ID:          "reset-model-auth-id",
+		FileName:    "reset-model-auth.json",
+		Provider:    "codex",
+		Status:      coreauth.StatusError,
+		Unavailable: true,
+		ModelStates: map[string]*coreauth.ModelState{
+			"gpt-reset-a": quotaLimitedManagementModelState(updatedAt, next),
+			"gpt-reset-b": quotaLimitedManagementModelState(updatedAt, next),
+		},
+	}
+	authIndex := auth.EnsureIndex()
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	body := fmt.Sprintf(`{"auth_index":%q,"model":"gpt-reset-a","observed_at":%q}`, authIndex, observedAt.Format(time.RFC3339Nano))
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/reset-model-cooldown", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.ResetModelCooldown(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		Status    string `json:"status"`
+		AuthIndex string `json:"auth_index"`
+		Model     string `json:"model"`
+		Reset     bool   `json:"reset"`
+	}
+	if errUnmarshal := json.Unmarshal(rec.Body.Bytes(), &payload); errUnmarshal != nil {
+		t.Fatalf("failed to decode response: %v", errUnmarshal)
+	}
+	if payload.Status != "ok" || payload.AuthIndex != authIndex || payload.Model != "gpt-reset-a" || !payload.Reset {
+		t.Fatalf("response = %+v", payload)
+	}
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth record to exist after reset")
+	}
+	if state := updated.ModelStates["gpt-reset-a"]; state == nil || state.Status != coreauth.StatusActive || state.Unavailable || state.Quota.Exceeded {
+		t.Fatalf("requested model state = %+v, want cleared", state)
+	}
+	if state := updated.ModelStates["gpt-reset-b"]; state == nil || state.Status != coreauth.StatusError || !state.Unavailable || !state.Quota.Exceeded {
+		t.Fatalf("unrelated model state = %+v, want preserved", state)
+	}
+}
+
+func TestResetModelCooldown_PreservesNewerFailure(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	observedAt := time.Now().Add(-time.Minute).UTC()
+	updatedAt := observedAt.Add(time.Second)
+	next := time.Now().Add(time.Hour)
+	auth := &coreauth.Auth{
+		ID:       "reset-newer-model-auth-id",
+		Provider: "codex",
+		Status:   coreauth.StatusError,
+		ModelStates: map[string]*coreauth.ModelState{
+			"gpt-reset-newer": quotaLimitedManagementModelState(updatedAt, next),
+		},
+	}
+	authIndex := auth.EnsureIndex()
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	body := fmt.Sprintf(`{"auth_index":%q,"model":"gpt-reset-newer","observed_at":%q}`, authIndex, observedAt.Format(time.RFC3339Nano))
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/reset-model-cooldown", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.ResetModelCooldown(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		Reset bool `json:"reset"`
+	}
+	if errUnmarshal := json.Unmarshal(rec.Body.Bytes(), &payload); errUnmarshal != nil {
+		t.Fatalf("failed to decode response: %v", errUnmarshal)
+	}
+	if payload.Reset {
+		t.Fatalf("response reset = true, want newer failure preserved")
+	}
+	updated, _ := manager.GetByID(auth.ID)
+	if state := updated.ModelStates["gpt-reset-newer"]; state == nil || state.Status != coreauth.StatusError || !state.Quota.Exceeded {
+		t.Fatalf("newer model state = %+v, want preserved", state)
+	}
+}
+
+func TestResetModelCooldown_ValidatesRequest(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, coreauth.NewManager(nil, nil, nil))
+	tests := []struct {
+		name string
+		body string
+		code int
+	}{
+		{name: "invalid json", body: `{`, code: http.StatusBadRequest},
+		{name: "missing auth index", body: `{"model":"gpt-test"}`, code: http.StatusBadRequest},
+		{name: "missing model", body: `{"auth_index":"missing"}`, code: http.StatusBadRequest},
+		{name: "invalid observed at", body: `{"auth_index":"missing","model":"gpt-test","observed_at":"yesterday"}`, code: http.StatusBadRequest},
+		{name: "unknown auth", body: `{"auth_index":"missing","model":"gpt-test"}`, code: http.StatusNotFound},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(rec)
+			req := httptest.NewRequest(http.MethodPost, "/v0/management/reset-model-cooldown", strings.NewReader(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			ctx.Request = req
+			h.ResetModelCooldown(ctx)
+			if rec.Code != tt.code {
+				t.Fatalf("status = %d, want %d with body %s", rec.Code, tt.code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func quotaLimitedManagementModelState(updatedAt, next time.Time) *coreauth.ModelState {
+	return &coreauth.ModelState{
+		Status:         coreauth.StatusError,
+		StatusMessage:  "quota exhausted",
+		Unavailable:    true,
+		NextRetryAfter: next,
+		Quota:          coreauth.QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: next, BackoffLevel: 2},
+		UpdatedAt:      updatedAt,
 	}
 }

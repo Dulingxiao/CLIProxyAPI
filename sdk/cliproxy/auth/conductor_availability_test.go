@@ -176,3 +176,186 @@ func TestManager_ResetQuotaClearsRuntimeAndRegistryState(t *testing.T) {
 		t.Fatalf("registry model count after reset = %d, want 1", count)
 	}
 }
+
+func TestManager_ResetModelCooldownClearsOnlyObservedModel(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	ctx := context.Background()
+	authID := "reset-model-cooldown-auth"
+	modelA := "reset-model-a"
+	modelB := "reset-model-b"
+	now := time.Now()
+	next := now.Add(time.Hour)
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(authID, "claude", []*registry.ModelInfo{{ID: modelA}, {ID: modelB}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(authID)
+	})
+
+	if _, errRegister := manager.Register(ctx, &Auth{
+		ID:          authID,
+		Provider:    "claude",
+		Status:      StatusError,
+		Unavailable: true,
+		ModelStates: map[string]*ModelState{
+			modelA: quotaLimitedModelState(now, next),
+			modelB: quotaLimitedModelState(now, next),
+		},
+	}); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	reg.SetModelQuotaExceeded(authID, modelA)
+	reg.SuspendClientModel(authID, modelA, "quota")
+	reg.SetModelQuotaExceeded(authID, modelB)
+	reg.SuspendClientModel(authID, modelB, "quota")
+
+	updated, resetModel, cleared, errReset := manager.ResetModelCooldown(ctx, authID, modelA, now.Add(time.Second))
+	if errReset != nil {
+		t.Fatalf("ResetModelCooldown() error = %v", errReset)
+	}
+	if updated == nil || resetModel != modelA || !cleared {
+		t.Fatalf("ResetModelCooldown() = auth %#v model %q cleared %v", updated, resetModel, cleared)
+	}
+	if updated.Success != 0 || updated.Failed != 0 {
+		t.Fatalf("diagnostic recovery changed request counters: success=%d failed=%d", updated.Success, updated.Failed)
+	}
+	if state := updated.ModelStates[modelA]; state == nil || !modelStateIsClean(state) {
+		t.Fatalf("reset model state = %#v, want clean", state)
+	}
+	if state := updated.ModelStates[modelB]; state == nil || modelStateIsClean(state) {
+		t.Fatalf("unrelated model state = %#v, want cooldown preserved", state)
+	}
+	if updated.Unavailable || updated.Status != StatusError {
+		t.Fatalf("aggregate auth state = status %q unavailable %v, want routable auth with remaining model error", updated.Status, updated.Unavailable)
+	}
+	if count := reg.GetModelCount(modelA); count != 1 {
+		t.Fatalf("reset model registry count = %d, want 1", count)
+	}
+	if count := reg.GetModelCount(modelB); count != 0 {
+		t.Fatalf("unrelated model registry count = %d, want 0", count)
+	}
+}
+
+func TestManager_ResetModelCooldownPreservesNewerFailure(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	ctx := context.Background()
+	authID := "reset-model-newer-failure-auth"
+	model := "reset-model-newer-failure"
+	observedAt := time.Now()
+	updatedAt := observedAt.Add(time.Second)
+	next := updatedAt.Add(time.Hour)
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(authID, "claude", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(authID)
+	})
+
+	if _, errRegister := manager.Register(ctx, &Auth{
+		ID:          authID,
+		Provider:    "claude",
+		Status:      StatusError,
+		Unavailable: true,
+		ModelStates: map[string]*ModelState{model: quotaLimitedModelState(updatedAt, next)},
+	}); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	reg.SetModelQuotaExceeded(authID, model)
+	reg.SuspendClientModel(authID, model, "quota")
+
+	updated, resetModel, cleared, errReset := manager.ResetModelCooldown(ctx, authID, model, observedAt)
+	if errReset != nil {
+		t.Fatalf("ResetModelCooldown() error = %v", errReset)
+	}
+	if updated == nil || resetModel != model || cleared {
+		t.Fatalf("ResetModelCooldown() = auth %#v model %q cleared %v", updated, resetModel, cleared)
+	}
+	if state := updated.ModelStates[model]; state == nil || modelStateIsClean(state) {
+		t.Fatalf("newer model state = %#v, want cooldown preserved", state)
+	}
+	if count := reg.GetModelCount(model); count != 0 {
+		t.Fatalf("newer failure registry count = %d, want 0", count)
+	}
+}
+
+func TestManager_ResetModelCooldownDoesNotCreateCleanModelState(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	ctx := context.Background()
+	authID := "reset-missing-model-state-auth"
+	model := "reset-missing-model-state"
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(authID, "claude", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(authID)
+	})
+
+	if _, errRegister := manager.Register(ctx, &Auth{ID: authID, Provider: "claude", Status: StatusActive}); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	reg.SetModelQuotaExceeded(authID, model)
+	reg.SuspendClientModel(authID, model, "quota")
+
+	updated, resetModel, cleared, errReset := manager.ResetModelCooldown(ctx, authID, model, time.Now())
+	if errReset != nil {
+		t.Fatalf("ResetModelCooldown() error = %v", errReset)
+	}
+	if updated == nil || resetModel != model || cleared {
+		t.Fatalf("ResetModelCooldown() = auth %#v model %q cleared %v", updated, resetModel, cleared)
+	}
+	if _, exists := updated.ModelStates[model]; exists {
+		t.Fatalf("successful probe created model state: %#v", updated.ModelStates[model])
+	}
+	if count := reg.GetModelCount(model); count != 1 {
+		t.Fatalf("registry model count = %d, want stale suspension cleared", count)
+	}
+}
+
+func TestManager_ResetModelCooldownResumesRegistryAfterNewerSuccess(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	ctx := context.Background()
+	authID := "reset-newer-success-auth"
+	model := "reset-newer-success-model"
+	observedAt := time.Now()
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(authID, "claude", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(authID)
+	})
+
+	if _, errRegister := manager.Register(ctx, &Auth{
+		ID:       authID,
+		Provider: "claude",
+		Status:   StatusActive,
+		ModelStates: map[string]*ModelState{
+			model: {Status: StatusActive, UpdatedAt: observedAt.Add(time.Second)},
+		},
+	}); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	reg.SetModelQuotaExceeded(authID, model)
+	reg.SuspendClientModel(authID, model, "quota")
+
+	updated, _, cleared, errReset := manager.ResetModelCooldown(ctx, authID, model, observedAt)
+	if errReset != nil {
+		t.Fatalf("ResetModelCooldown() error = %v", errReset)
+	}
+	if updated == nil || cleared {
+		t.Fatalf("ResetModelCooldown() = auth %#v cleared %v", updated, cleared)
+	}
+	if count := reg.GetModelCount(model); count != 1 {
+		t.Fatalf("registry model count = %d, want stale suspension cleared", count)
+	}
+}
+
+func quotaLimitedModelState(updatedAt, next time.Time) *ModelState {
+	return &ModelState{
+		Status:         StatusError,
+		StatusMessage:  "quota exhausted",
+		Unavailable:    true,
+		NextRetryAfter: next,
+		Quota:          QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: next, BackoffLevel: 2},
+		UpdatedAt:      updatedAt,
+	}
+}
