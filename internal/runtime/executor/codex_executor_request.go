@@ -152,7 +152,7 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 		return nil, nil, codexIdentityConfuseState{}, err
 	}
 	if cache.ID != "" {
-		httpReq.Header.Set("Session_id", cache.ID)
+		httpReq.Header.Set("Session-Id", cache.ID)
 	}
 	return httpReq, rawJSON, identityState, nil
 }
@@ -221,7 +221,7 @@ func applyCodexIdentityConfuseHeaders(headers http.Header, state *codexIdentityC
 			headers.Set("X-Codex-Turn-Metadata", applyCodexTurnMetadataIdentityConfuse(rawTurnMetadata, state))
 		}
 		if state.promptCacheKey != "" {
-			setCodexSessionHeaderCasePreserved(headers, "Session_id", state.promptCacheKey)
+			setCodexSessionHeaderCasePreserved(headers, "Session-Id", state.promptCacheKey)
 			if headerValueCaseInsensitive(headers, "Conversation_id") != "" {
 				setHeaderCasePreserved(headers, "Conversation_id", state.promptCacheKey)
 			}
@@ -351,12 +351,13 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 	misc.EnsureHeader(r.Header, ginHeaders, "Version", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-Metadata", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", "")
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Window-Id", "")
+	misc.EnsureHeader(r.Header, ginHeaders, "Thread-Id", "")
+	misc.EnsureHeader(r.Header, ginHeaders, "Session-Id", "")
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Openai-Internal-Codex-Responses-Lite", "")
+
 	cfgUserAgent, _ := codexHeaderDefaults(cfg, auth)
 	ensureHeaderWithConfigPrecedence(r.Header, ginHeaders, "User-Agent", cfgUserAgent, codexUserAgent)
-
-	if strings.Contains(r.Header.Get("User-Agent"), "Mac OS") {
-		misc.EnsureHeader(r.Header, ginHeaders, "Session_id", uuid.NewString())
-	}
 
 	if stream {
 		r.Header.Set("Accept", "text/event-stream")
