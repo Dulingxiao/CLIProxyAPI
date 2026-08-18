@@ -14,6 +14,10 @@ var (
 	ErrNoActiveOwner = errors.New("no active overdraft owner")
 	// ErrCapacity indicates that the configured concurrent lease ceiling is full.
 	ErrCapacity = errors.New("overdraft capacity reached")
+	// ErrLateAdmissionExhausted indicates the drain owner used its full
+	// late-admission budget while still blocked, so it cannot admit more
+	// speculative traffic and should be retired for a fresh candidate.
+	ErrLateAdmissionExhausted = errors.New("overdraft late-admission budget exhausted")
 	// ErrStaleLease indicates that a lease failed a generation or epoch fence.
 	ErrStaleLease = errors.New("stale overdraft lease")
 	// ErrInvalidState indicates that an operation does not apply to the current state.
@@ -303,7 +307,7 @@ func (c *Coordinator) AcquireLateBusiness(dispatchID string, maxAttempts int) (*
 		return nil, ErrNoActiveOwner
 	}
 	if record.LateAdmissionAttempts >= maxAttempts {
-		return nil, ErrCapacity
+		return nil, ErrLateAdmissionExhausted
 	}
 	lease, errAcquire := c.acquireLocked(record, dispatchID, LeaseBusiness)
 	if errAcquire != nil {
@@ -317,6 +321,37 @@ func (c *Coordinator) AcquireLateBusiness(dispatchID string, maxAttempts int) (*
 		return nil, errPersist
 	}
 	return lease, nil
+}
+
+// RetireStalledLateOwner exhausts an ACTIVE_DRAIN owner that spent its full
+// late-admission budget entirely on usage-limit failures while its cooldown
+// never cleared. Without this the owner cannot admit traffic (late budget spent)
+// yet never reaches the consecutive usage-limit count that marks it EXHAUSTED,
+// so the pool stalls with a permanently idle owner. A budget spent on
+// non-failing sends (ProbeFailures below the budget) means the owner is still
+// serving, so it is left in place. Retiring a truly stalled owner lets the next
+// candidate take over.
+func (c *Coordinator) RetireStalledLateOwner(authID string, maxAttempts int) (bool, error) {
+	if authID == "" || maxAttempts <= 0 {
+		return false, nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.config.Enabled || c.state.Owner != authID {
+		return false, nil
+	}
+	record, ok := c.state.Records[authID]
+	if !ok || record.State != StateActiveDrain || record.Disabled || record.CalibrationRequired || record.LateAdmissionAttempts < maxAttempts || record.ProbeFailures < maxAttempts {
+		return false, nil
+	}
+	record.State = StateExhausted
+	record.StateEpoch++
+	record.ProbeFailures = c.config.ExhaustionProbeFailures
+	record.ExhaustedAt = c.clock.Now()
+	c.state.Records[authID] = record
+	c.state.Owner = ""
+	c.promoteLocked()
+	return true, c.persistLocked()
 }
 
 // AcquireProbe reserves the single serial probe permit for the VERIFYING owner.

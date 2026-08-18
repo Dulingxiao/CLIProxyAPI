@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strconv"
@@ -412,7 +413,19 @@ func (m *Manager) acquireCodexOverdraftExecution(providers []string, req cliprox
 		lease, errAcquire = coordinator.AcquireBusiness(dispatchIDFromOptions(opts))
 	}
 	if errAcquire != nil {
-		logCodexOverdraftRejection("lease_denied: "+errAcquire.Error(), owner, req.Model)
+		if lateAdmission && errors.Is(errAcquire, codexoverdraft.ErrLateAdmissionExhausted) {
+			// The owner spent its late-admission budget while still blocked and
+			// can no longer admit traffic, yet it will never accumulate enough
+			// usage-limit results to exhaust on its own. Retire it so a fresh
+			// candidate can take over instead of stalling the pool.
+			if retired, errRetire := coordinator.RetireStalledLateOwner(owner, lateAdmissionMaxAttempts); errRetire != nil {
+				logEntryWithRequestID(nil).WithField("auth_id", owner).Warnf("failed to retire stalled Codex overdraft owner: %v", errRetire)
+			} else if retired {
+				logCodexOverdraftRejection("late_admission_exhausted_owner_retired", owner, req.Model)
+			}
+		} else {
+			logCodexOverdraftRejection("lease_denied: "+errAcquire.Error(), owner, req.Model)
+		}
 		rejectOwner()
 		return nil, nil, false
 	}

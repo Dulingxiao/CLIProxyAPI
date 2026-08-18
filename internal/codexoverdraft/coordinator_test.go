@@ -206,6 +206,57 @@ func TestCoordinatorLeaseFenceLimitAndSwitch(t *testing.T) {
 	}
 }
 
+func TestCoordinatorRetireStalledLateOwnerPromotesNextCandidate(t *testing.T) {
+	c := enabledCoordinator(t, &fakeClock{now: time.Now()}, nil)
+	for _, id := range []string{"owner", "next"} {
+		if errRegister := c.RegisterAuth(id, 1, 0); errRegister != nil {
+			t.Fatal(errRegister)
+		}
+	}
+	_ = c.ObserveThreshold("owner", 1, 99_000_000)
+	_ = c.ObserveThreshold("next", 1, 99_000_000)
+	if got := c.Owner(); got != "owner" {
+		t.Fatalf("owner = %q, want owner", got)
+	}
+
+	// Spend the late-admission budget while the owner stays blocked upstream:
+	// each attempt records a usage-limit 429 but never reaches the exhaustion count.
+	const maxAttempts = 3
+	for i := 0; i < maxAttempts; i++ {
+		lease, errLease := c.AcquireLateBusiness(fmt.Sprintf("late-%d", i), maxAttempts)
+		if errLease != nil {
+			t.Fatalf("AcquireLateBusiness(%d) error = %v", i, errLease)
+		}
+		if errBegin := c.BeginSend(lease); errBegin != nil {
+			t.Fatal(errBegin)
+		}
+		if errLimit := c.BusinessUsageLimit(lease); errLimit != nil {
+			t.Fatal(errLimit)
+		}
+		_ = c.Release(lease)
+	}
+	if _, errLease := c.AcquireLateBusiness("late-final", maxAttempts); !errors.Is(errLease, ErrLateAdmissionExhausted) {
+		t.Fatalf("AcquireLateBusiness after budget error = %v, want ErrLateAdmissionExhausted", errLease)
+	}
+	if got := c.Record("owner"); got.State != StateActiveDrain {
+		t.Fatalf("owner state before retire = %s, want ACTIVE_DRAIN (stalled)", got.State)
+	}
+
+	retired, errRetire := c.RetireStalledLateOwner("owner", maxAttempts)
+	if errRetire != nil || !retired {
+		t.Fatalf("RetireStalledLateOwner() = %t, %v", retired, errRetire)
+	}
+	if got := c.Record("owner").State; got != StateExhausted {
+		t.Fatalf("owner state after retire = %s, want EXHAUSTED", got)
+	}
+	if got := c.Owner(); got != "next" {
+		t.Fatalf("owner after retire = %q, want next", got)
+	}
+	if got := c.Record("next").State; got != StateActiveDrain {
+		t.Fatalf("next state = %s, want ACTIVE_DRAIN", got)
+	}
+}
+
 func TestCoordinatorLeaseRevalidatesEveryActualSend(t *testing.T) {
 	c := enabledCoordinator(t, &fakeClock{now: time.Now()}, nil)
 	_ = c.RegisterAuth("auth", 1, 0)
