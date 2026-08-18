@@ -648,6 +648,44 @@ func (s *Service) Aggregate(authID, drainCycleID string) Aggregate {
 	return accumulator.finalize()
 }
 
+// AggregateDrainCycles rebuilds totals for many auth/drain-cycle pairs in one storage pass.
+// The input maps Auth.ID to its drain cycle ID; the result is keyed by drain cycle ID.
+func (s *Service) AggregateDrainCycles(cycles map[string]string) map[string]Aggregate {
+	accumulators := make(map[string]*aggregateAccumulator, len(cycles))
+	for authID, drainCycleID := range cycles {
+		if authID == "" || drainCycleID == "" {
+			continue
+		}
+		accumulators[authID] = newAggregateAccumulator(authID, drainCycleID)
+	}
+	results := make(map[string]Aggregate, len(accumulators))
+	if s == nil || s.store == nil || len(accumulators) == 0 {
+		for _, accumulator := range accumulators {
+			results[accumulator.result.DrainCycleID] = accumulator.result
+		}
+		return results
+	}
+	costs := s.aggregateCostSnapshot()
+	for _, event := range s.store.UsageEvents() {
+		accumulator := accumulators[event.AuthID]
+		if accumulator == nil || event.DrainCycleID != accumulator.result.DrainCycleID {
+			continue
+		}
+		accumulator.addEvent(event, costs[event.EventID].Cost.TotalNanoUSD)
+	}
+	for _, closure := range s.store.Closures() {
+		accumulator := accumulators[closure.AuthID]
+		if accumulator == nil || closure.DrainCycleID != accumulator.result.DrainCycleID {
+			continue
+		}
+		accumulator.addClosure(closure)
+	}
+	for _, accumulator := range accumulators {
+		results[accumulator.result.DrainCycleID] = accumulator.finalize()
+	}
+	return results
+}
+
 // AggregatesByAuth rebuilds all per-auth totals in one bounded pass over immutable records.
 func (s *Service) AggregatesByAuth() []Aggregate {
 	if s == nil || s.store == nil {

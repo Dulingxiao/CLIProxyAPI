@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -91,15 +93,67 @@ func (h *Handler) GetCodexOverdraftStatus(c *gin.Context) {
 	}
 	h.mu.Unlock()
 	records := coordinator.Records()
-	drainMetrics := make(map[string]usageaccounting.Aggregate)
-	if service := h.accountingService(); service != nil {
-		for authID, record := range records {
-			if record.DrainCycleID != "" {
-				drainMetrics[record.DrainCycleID] = service.Aggregate(authID, record.DrainCycleID)
-			}
+	drainCycles := make(map[string]string, len(records))
+	for authID, record := range records {
+		if record.DrainCycleID != "" {
+			drainCycles[authID] = record.DrainCycleID
 		}
 	}
+	drainMetrics := h.cachedDrainCycleMetrics(drainCycles)
 	c.JSON(http.StatusOK, gin.H{"enabled": coordinator.Enabled(), "healthy": healthy, "last_error": lastError, "owner_auth_id": coordinator.Owner(), "coordinator_epoch": coordinator.Epoch(), "records": records, "candidates": coordinator.Candidates(), "candidate_queue": coordinator.CandidateQueueMetrics(), "drain_cycle_accounting": drainMetrics, "lease_in_flight": occupancy.LeaseInFlight, "inherited_in_flight": occupancy.InheritedInFlight, "total_in_flight": occupancy.TotalInFlight, "max_in_flight": occupancy.MaxInFlight, "per_auth_in_flight": occupancy.PerAuthInFlight, "per_auth_max_in_flight": occupancy.PerAuthMaxInFlight, "credit_protected_auths": h.authManager.CodexCreditProtectionCount(), "allow_credit_spend": allowCreditSpend})
+}
+
+// drainCycleMetricsTTL bounds how often the heavy accounting storage scan may run.
+const drainCycleMetricsTTL = 30 * time.Second
+
+// codexDrainMetricsCache serves possibly-stale drain accounting so status responses stay fast.
+type codexDrainMetricsCache struct {
+	mu         sync.Mutex
+	key        string
+	computedAt time.Time
+	metrics    map[string]usageaccounting.Aggregate
+	inFlight   bool
+}
+
+// cachedDrainCycleMetrics returns the latest computed drain accounting without blocking the
+// request on a storage scan. The scan runs at most once per TTL in the background; callers may
+// observe stale or empty metrics until the next pass completes.
+func (h *Handler) cachedDrainCycleMetrics(drainCycles map[string]string) map[string]usageaccounting.Aggregate {
+	empty := map[string]usageaccounting.Aggregate{}
+	if len(drainCycles) == 0 {
+		return empty
+	}
+	service := h.accountingService()
+	if service == nil {
+		return empty
+	}
+	keys := make([]string, 0, len(drainCycles))
+	for authID, drainCycleID := range drainCycles {
+		keys = append(keys, authID+"="+drainCycleID)
+	}
+	sort.Strings(keys)
+	key := strings.Join(keys, ",")
+	cache := &h.drainMetricsCache
+	cache.mu.Lock()
+	metrics := cache.metrics
+	fresh := cache.key == key && time.Since(cache.computedAt) < drainCycleMetricsTTL
+	if !fresh && !cache.inFlight {
+		cache.inFlight = true
+		go func() {
+			computed := service.AggregateDrainCycles(drainCycles)
+			cache.mu.Lock()
+			cache.metrics = computed
+			cache.key = key
+			cache.computedAt = time.Now()
+			cache.inFlight = false
+			cache.mu.Unlock()
+		}()
+	}
+	cache.mu.Unlock()
+	if metrics == nil {
+		return empty
+	}
+	return metrics
 }
 
 // GetCodexQuotaSnapshots returns the latest active/passive snapshots.

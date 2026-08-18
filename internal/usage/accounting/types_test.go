@@ -316,6 +316,38 @@ func TestAggregatesByAuthReturnsSortedIndependentTotals(t *testing.T) {
 	}
 }
 
+func TestAggregateDrainCyclesMatchesPerPairAggregatesInOnePass(t *testing.T) {
+	store := NewMemoryStore()
+	service := NewService(store, 8)
+	defer service.Close()
+
+	for _, record := range []coreusage.Record{
+		{AuthID: "auth-a", UpstreamAttemptID: "a-cycle-1", DrainMode: "overdraft", DrainCycleID: "cycle-1", UsageReported: true, Detail: coreusage.Detail{TotalTokens: 11}},
+		{AuthID: "auth-a", UpstreamAttemptID: "a-cycle-old", DrainMode: "overdraft", DrainCycleID: "cycle-old", UsageReported: true, Detail: coreusage.Detail{TotalTokens: 5}},
+		{AuthID: "auth-b", UpstreamAttemptID: "b-cycle-2", DrainMode: "overdraft", DrainCycleID: "cycle-2", UsageReported: true, Failed: true, Detail: coreusage.Detail{TotalTokens: 7}},
+		{AuthID: "auth-c", UpstreamAttemptID: "c-no-cycle", DrainMode: "normal", UsageReported: true, Detail: coreusage.Detail{TotalTokens: 3}},
+	} {
+		service.HandleUsage(context.Background(), record)
+	}
+	if errFlush := service.Flush(context.Background()); errFlush != nil {
+		t.Fatal(errFlush)
+	}
+
+	results := service.AggregateDrainCycles(map[string]string{"auth-a": "cycle-1", "auth-b": "cycle-2", "auth-empty": ""})
+	if len(results) != 2 {
+		t.Fatalf("results = %#v", results)
+	}
+	for _, pair := range []struct{ authID, drainCycleID string }{{"auth-a", "cycle-1"}, {"auth-b", "cycle-2"}} {
+		expected := service.Aggregate(pair.authID, pair.drainCycleID)
+		if results[pair.drainCycleID] != expected {
+			t.Fatalf("cycle %s aggregate = %#v, want %#v", pair.drainCycleID, results[pair.drainCycleID], expected)
+		}
+	}
+	if results["cycle-1"].OverdraftBusinessTotalTokens != 11 || results["cycle-2"].BusinessFailures != 1 {
+		t.Fatalf("results = %#v", results)
+	}
+}
+
 func TestBoltStoreRestoresPricesAndCostResults(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "accounting.db")
 	store, errOpen := OpenBoltStore(path)
