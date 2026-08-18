@@ -68,6 +68,67 @@ func TestCodexExecutorInjectsOverdraftBeforeActualHTTPSend(t *testing.T) {
 	}
 }
 
+func TestCodexExecutorMovesCompactionTriggerToEnd(t *testing.T) {
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		var errRead error
+		gotBody, errRead = io.ReadAll(request.Body)
+		if errRead != nil {
+			t.Errorf("read request body: %v", errRead)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{ID: "auth-1", Provider: "codex", Attributes: map[string]string{"base_url": server.URL, "api_key": "test"}}
+	payload := []byte(`{"model":"gpt-5.4","input":[{"type":"message","role":"user","content":"history"},{"type":"compaction_trigger"},{"type":"message","role":"user","content":"after"}]}`)
+	_, errExecute := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{Model: "gpt-5.4", Payload: payload}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	input := gjson.GetBytes(gotBody, "input").Array()
+	if len(input) != 3 {
+		t.Fatalf("upstream input length = %d, body = %s", len(input), gotBody)
+	}
+	if got := input[2].Get("type").String(); got != "compaction_trigger" {
+		t.Fatalf("final input item type = %q, want compaction_trigger; body=%s", got, gotBody)
+	}
+	if got := input[1].Get("content").String(); got != "after" {
+		t.Fatalf("non-trigger item was not preserved before trigger: %s", gotBody)
+	}
+}
+
+func TestCodexExecutorKeepsCompactionTriggerFinalWithOverdraft(t *testing.T) {
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		var errRead error
+		gotBody, errRead = io.ReadAll(request.Body)
+		if errRead != nil {
+			t.Errorf("read request body: %v", errRead)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"output\":[{\"type\":\"compaction\",\"encrypted_content\":\"opaque\"}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{ID: "auth-1", Provider: "codex", Attributes: map[string]string{"base_url": server.URL, "api_key": "test"}}
+	payload := []byte(`{"model":"gpt-5.4","input":[{"type":"message","role":"user","content":"history"},{"type":"compaction_trigger"}]}`)
+	_, errExecute := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{Model: "gpt-5.4", Payload: payload}, overdraftOptions(func() error { return nil }, func() {}))
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	input := gjson.GetBytes(gotBody, "input").Array()
+	if len(input) == 0 {
+		t.Fatalf("upstream body missing input: %s", gotBody)
+	}
+	if got := input[len(input)-1].Get("type").String(); got != "compaction_trigger" {
+		t.Fatalf("final input item type = %q, want compaction_trigger; body=%s", got, gotBody)
+	}
+}
+
 func TestCodexExecutorBeginSendFailureDoesNotReachUpstream(t *testing.T) {
 	var requests atomic.Int32
 	var released atomic.Bool

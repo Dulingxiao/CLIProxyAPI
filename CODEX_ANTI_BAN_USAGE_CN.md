@@ -113,7 +113,7 @@ accounting:
 | 状态 | 含义 | 运维关注点 |
 |---|---|---|
 | `NORMAL` | 普通调度 | 等待主动额度快照 |
-| `CANDIDATE` | 已达到阈值，进入 FIFO | 查看候选队列长度和队首等待时间 |
+| `CANDIDATE` | 已达到阈值，进入待选池 FIFO | 查看候选队列长度和队首等待时间 |
 | `ACTIVE_DRAIN` | 当前唯一超刷 owner | 业务租约同时受全局和单 Auth 上限约束；`probe_failures` 是连续额度 429 次数 |
 | `EXHAUSTED` | 超刷后连续十次结构化 `usage_limit_reached` 429 | 等待主动额度查询确认新周期恢复 |
 | `DISABLED` | 运维或认证状态禁用 | 检查 Auth 生命周期和认证状态 |
@@ -121,7 +121,8 @@ accounting:
 重要行为：
 
 - 同一时刻只有一个 `ACTIVE_DRAIN` owner。
-- `CANDIDATE` 仍参与普通轮询；只有 `EXHAUSTED` 和 Overlay `DISABLED` 会退出普通选择。兼容超刷的请求优先走 `ACTIVE_DRAIN` 租约，租约拿不到时溢出到 `NORMAL`/`CANDIDATE`，不会绕过 `max-in-flight`。
+- 兼容超刷的请求优先走 `ACTIVE_DRAIN` 租约；租约拿不到或超刷请求报错时，同一请求立即回退普通轮询（owner 计入已尝试，不会绕过 `max-in-flight`）。
+- 存在可用（非校准中、未禁用）的 `ACTIVE_DRAIN` owner 时，`CANDIDATE` 待选池账号退出普通轮询、闲置等待接替；若超刷池暂无可用 owner（例如重启后 owner 尚待额度校准），待选池账号临时继续服务普通流量，避免全站不可用。`EXHAUSTED` 和 Overlay `DISABLED` 始终退出普通选择。
 - `max-in-flight` 是所有超刷租约和继承请求的全局上限。
 - `per-auth-max-in-flight: 0` 表示沿用全局上限；正整数表示额外的单 Auth 上限。
 - 每个超刷上游请求都会在最终 Codex `input` 末尾追加相邻的 `zz` 调用和输出，内部重试会生成新的 Attempt ID 与 Call ID。

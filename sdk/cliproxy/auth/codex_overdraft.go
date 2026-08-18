@@ -312,14 +312,27 @@ func (m *Manager) excludeCodexOverdraftOverlay(tried map[string]struct{}) {
 	if coordinator == nil || !coordinator.Enabled() {
 		return
 	}
-	// Only terminal overlay states leave ordinary round-robin. CANDIDATE
-	// accounts still serve normal traffic while they wait in the FIFO.
-	// ACTIVE_DRAIN is admitted through acquireCodexOverdraftExecution; a
-	// failed lease marks that owner tried so MaxInFlight cannot be bypassed.
-	for authID, record := range coordinator.Records() {
+	// Terminal overlay states always leave ordinary round-robin. CANDIDATE
+	// accounts wait idle in the FIFO while an admitting drain owner exists;
+	// if the overdraft pool has no admitting owner (for example while a
+	// restarted owner still requires calibration) candidates keep serving so
+	// the fleet cannot go dark. ACTIVE_DRAIN is admitted through
+	// acquireCodexOverdraftExecution; a failed lease marks that owner tried
+	// so MaxInFlight cannot be bypassed.
+	records := coordinator.Records()
+	ownerAdmitting := false
+	if owner := coordinator.Owner(); owner != "" {
+		ownerRecord := records[owner]
+		ownerAdmitting = ownerRecord.State == codexoverdraft.StateActiveDrain && !ownerRecord.Disabled && !ownerRecord.CalibrationRequired
+	}
+	for authID, record := range records {
 		switch record.State {
 		case codexoverdraft.StateExhausted, codexoverdraft.StateDisabled:
 			tried[authID] = struct{}{}
+		case codexoverdraft.StateCandidate:
+			if ownerAdmitting {
+				tried[authID] = struct{}{}
+			}
 		}
 	}
 }
@@ -457,8 +470,28 @@ func codexOverdraftRequestCompatible(providers []string, req cliproxyexecutor.Re
 	if strings.EqualFold(strings.TrimSpace(opts.Alt), "responses/compact") {
 		return false
 	}
+	if payloadHasInputItemType(req.Payload, "compaction_trigger") {
+		return false
+	}
 	path := strings.ToLower(strings.TrimSpace(metadataString(opts.Metadata, cliproxyexecutor.RequestPathMetadataKey)))
 	return !strings.Contains(path, "/images/") && !strings.Contains(path, "/videos/") && !strings.Contains(path, "/responses/compact") && !strings.Contains(path, "count_tokens")
+}
+
+func payloadHasInputItemType(payload []byte, itemType string) bool {
+	itemType = strings.TrimSpace(itemType)
+	if len(payload) == 0 || itemType == "" {
+		return false
+	}
+	input := gjson.GetBytes(payload, "input")
+	if !input.IsArray() {
+		return false
+	}
+	for _, item := range input.Array() {
+		if strings.EqualFold(strings.TrimSpace(item.Get("type").String()), itemType) {
+			return true
+		}
+	}
+	return false
 }
 
 func dispatchIDFromOptions(opts cliproxyexecutor.Options) string {

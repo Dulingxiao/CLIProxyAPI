@@ -80,6 +80,24 @@ func TestValidateCodexOverdraftInjectionRejectsNonStringFields(t *testing.T) {
 	}
 }
 
+func TestPrepareCodexOverdraftBodySkipsCompactionTrigger(t *testing.T) {
+	execution := cliproxyexecutor.NewCodexOverdraftExecution("auth", 1, "cycle", 1, 1, "dispatch", cliproxyexecutor.CodexOverdraftBusiness, nil, nil, nil)
+	opts := cliproxyexecutor.Options{Metadata: map[string]any{cliproxyexecutor.CodexOverdraftExecutionMetadataKey: execution}}
+	original := []byte(`{"model":"gpt-test","input":[{"type":"message","role":"user","content":"history"},{"type":"compaction_trigger"}]}`)
+
+	got, errPrepare := PrepareCodexOverdraftBody(original, opts)
+	if errPrepare != nil {
+		t.Fatal(errPrepare)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("compaction_trigger request was mutated:\n got %s\nwant %s", got, original)
+	}
+	input := gjson.GetBytes(got, "input").Array()
+	if len(input) != 2 || input[len(input)-1].Get("type").String() != "compaction_trigger" {
+		t.Fatalf("compaction_trigger is not the final input item: %s", got)
+	}
+}
+
 func TestRefreshCodexOverdraftInjectionRotatesCallID(t *testing.T) {
 	execution := cliproxyexecutor.NewCodexOverdraftExecution("auth", 1, "cycle", 1, 1, "dispatch", cliproxyexecutor.CodexOverdraftBusiness, nil, nil, nil)
 	opts := cliproxyexecutor.Options{Metadata: map[string]any{cliproxyexecutor.CodexOverdraftExecutionMetadataKey: execution}}

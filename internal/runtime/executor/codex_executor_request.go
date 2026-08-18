@@ -183,7 +183,7 @@ func normalizeCodexUpstreamRequestMetadata(auth *cliproxyauth.Auth, requestURL s
 			}
 		}
 	}
-	return body
+	return helps.EnsureCodexCompactionTriggerIsFinal(body)
 }
 
 func applyCodexIdentityConfuseBody(cfg *config.Config, auth *cliproxyauth.Auth, userPayload []byte, rawJSON []byte) ([]byte, codexIdentityConfuseState) {

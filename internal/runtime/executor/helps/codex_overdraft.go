@@ -152,6 +152,11 @@ func PrepareCodexOverdraftBody(body []byte, opts cliproxyexecutor.Options) ([]by
 	if execution == nil {
 		return body, nil
 	}
+	// Remote compaction v2 places compaction_trigger last. Appending the zz pair
+	// after it is rejected by upstream as "must be the final input item".
+	if CodexInputHasItemType(body, codexCompactionTriggerType) {
+		return body, nil
+	}
 	injected, errInject := InjectCodexOverdraft(body)
 	if errInject != nil {
 		execution.Release()

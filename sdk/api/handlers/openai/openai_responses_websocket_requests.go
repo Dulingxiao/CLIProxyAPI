@@ -338,6 +338,17 @@ func mergeResponsesWebsocketInput(lastRequest []byte, lastResponseOutput []byte,
 			return "", fmt.Errorf("invalid previous response output: %w", errUnmarshal)
 		}
 	}
+	if inputContainsFullTranscript(gjson.ParseBytes(trimmedResponse)) {
+		filtered := items[:0]
+		for _, item := range items {
+			if item.itemType == "compaction_trigger" {
+				continue
+			}
+			filtered = append(filtered, item)
+		}
+		clear(items[len(filtered):])
+		items = filtered
+	}
 	items, errResponse := appendResponsesWebsocketRawInputItems(items, responseItems)
 	if errResponse != nil {
 		return "", fmt.Errorf("invalid previous response output: %w", errResponse)

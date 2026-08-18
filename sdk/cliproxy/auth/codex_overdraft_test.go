@@ -165,8 +165,8 @@ func TestManagerExcludesOverlayStatesFromNormalSelection(t *testing.T) {
 	if _, ok := tried["active"]; ok {
 		t.Fatal("ACTIVE_DRAIN auth excluded from ordinary selection")
 	}
-	if _, ok := tried["candidate"]; ok {
-		t.Fatal("CANDIDATE auth excluded from ordinary selection")
+	if _, ok := tried["candidate"]; !ok {
+		t.Fatal("CANDIDATE auth remains in ordinary selection while an admitting drain owner exists")
 	}
 	if _, ok := tried["normal"]; ok {
 		t.Fatal("NORMAL auth excluded from ordinary selection")
@@ -176,6 +176,75 @@ func TestManagerExcludesOverlayStatesFromNormalSelection(t *testing.T) {
 	}
 	if _, ok := tried["disabled"]; !ok {
 		t.Fatal("DISABLED overlay auth remains in ordinary selection")
+	}
+
+}
+
+type memoryOverdraftStore struct {
+	state codexoverdraft.PersistentState
+	saved bool
+}
+
+func (s *memoryOverdraftStore) Load() (codexoverdraft.PersistentState, error) {
+	if !s.saved {
+		return codexoverdraft.PersistentState{}, nil
+	}
+	return s.state, nil
+}
+
+func (s *memoryOverdraftStore) Save(state codexoverdraft.PersistentState) error {
+	cloned := state
+	cloned.Records = make(map[string]codexoverdraft.Record, len(state.Records))
+	for id, record := range state.Records {
+		cloned.Records[id] = record
+	}
+	s.state = cloned
+	s.saved = true
+	return nil
+}
+
+func TestCandidatesServeOrdinaryTrafficWithoutAdmittingOwner(t *testing.T) {
+	config := codexoverdraft.CoordinatorConfig{
+		Enabled:                 true,
+		ThresholdMicropct:       98_000_000,
+		MaxInFlight:             40,
+		ExhaustionProbeFailures: 10,
+	}
+	store := &memoryOverdraftStore{}
+	coordinator, errNew := codexoverdraft.NewCoordinator(config, store, nil)
+	if errNew != nil {
+		t.Fatal(errNew)
+	}
+	for _, id := range []string{"owner", "candidate"} {
+		if errRegister := coordinator.RegisterAuth(id, 1, 0); errRegister != nil {
+			t.Fatal(errRegister)
+		}
+	}
+	_ = coordinator.ObserveThreshold("owner", 1, 99_000_000)
+	_ = coordinator.ObserveThreshold("candidate", 1, 99_000_000)
+	if coordinator.Owner() != "owner" {
+		t.Fatalf("expected owner promotion, got %q", coordinator.Owner())
+	}
+
+	// Simulate a restart: the persisted owner and candidate both require
+	// calibration, so the pool has no admitting owner yet.
+	restarted, errRestart := codexoverdraft.NewCoordinator(config, store, nil)
+	if errRestart != nil {
+		t.Fatal(errRestart)
+	}
+	if record := restarted.Record("owner"); !record.CalibrationRequired {
+		t.Fatal("expected persisted owner to require calibration after restart")
+	}
+
+	m := NewManager(nil, nil, nil)
+	m.SetCodexOverdraftCoordinator(restarted)
+	tried := make(map[string]struct{})
+	m.excludeCodexOverdraftOverlay(tried)
+	if _, ok := tried["candidate"]; ok {
+		t.Fatal("CANDIDATE auth excluded from ordinary selection without an admitting drain owner")
+	}
+	if _, ok := tried["owner"]; ok {
+		t.Fatal("calibration-pending owner excluded from ordinary selection")
 	}
 }
 
@@ -458,11 +527,20 @@ func TestManagerOverdraftExecutionHonorsPinnedAndExcludedRequests(t *testing.T) 
 	for _, opts := range []cliproxyexecutor.Options{
 		{Alt: "responses/compact"},
 		{Metadata: map[string]any{cliproxyexecutor.RequestPathMetadataKey: "/v1/images/generations"}},
+		{Metadata: map[string]any{cliproxyexecutor.RequestPathMetadataKey: "/v1/responses/compact"}},
 		{Metadata: map[string]any{cliproxyexecutor.PinnedAuthMetadataKey: "another"}},
 	} {
 		if execution, _, ok := m.acquireCodexOverdraftExecution([]string{"codex"}, request, opts, map[string]struct{}{}); ok || execution != nil {
 			t.Fatalf("excluded request acquired execution for opts %#v", opts)
 		}
+	}
+
+	triggerRequest := cliproxyexecutor.Request{
+		Model:   "gpt-test",
+		Payload: []byte(`{"input":[{"type":"message","role":"user","content":"history"},{"type":"compaction_trigger"}]}`),
+	}
+	if execution, _, ok := m.acquireCodexOverdraftExecution([]string{"codex"}, triggerRequest, cliproxyexecutor.Options{}, map[string]struct{}{}); ok || execution != nil {
+		t.Fatal("compaction_trigger request acquired an overdraft lease")
 	}
 }
 

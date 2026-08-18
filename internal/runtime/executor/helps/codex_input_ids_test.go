@@ -10,6 +10,44 @@ import (
 
 var benchmarkSanitizeCodexInputItemIDsOutput []byte
 
+func TestEnsureCodexCompactionTriggerIsFinal(t *testing.T) {
+	t.Parallel()
+
+	alreadyFinal := []byte(`{"input":[{"type":"message","role":"user","content":"history"},{"type":"compaction_trigger"}]}`)
+	if got := EnsureCodexCompactionTriggerIsFinal(alreadyFinal); string(got) != string(alreadyFinal) {
+		t.Fatalf("already-final trigger was rewritten: %s", got)
+	}
+
+	reordered := EnsureCodexCompactionTriggerIsFinal([]byte(`{"input":[
+		{"type":"message","role":"user","id":"msg-1","content":"history"},
+		{"type":"compaction_trigger"},
+		{"type":"function_call","call_id":"call_zz","name":"zz","arguments":"{}"},
+		{"type":"function_call_output","call_id":"call_zz","output":"{}"}
+	]}`))
+	input := gjson.GetBytes(reordered, "input").Array()
+	if len(input) != 4 || input[3].Get("type").String() != "compaction_trigger" {
+		t.Fatalf("trigger was not moved to the end: %s", reordered)
+	}
+	if input[1].Get("name").String() != "zz" || input[2].Get("type").String() != "function_call_output" {
+		t.Fatalf("non-trigger items were reordered incorrectly: %s", reordered)
+	}
+
+	deduped := EnsureCodexCompactionTriggerIsFinal([]byte(`{"input":[
+		{"type":"compaction_trigger"},
+		{"type":"message","role":"user","id":"msg-1"},
+		{"type":"compaction_trigger"}
+	]}`))
+	dedupedInput := gjson.GetBytes(deduped, "input").Array()
+	if len(dedupedInput) != 2 || dedupedInput[0].Get("id").String() != "msg-1" || dedupedInput[1].Get("type").String() != "compaction_trigger" {
+		t.Fatalf("duplicate triggers were not collapsed to a final item: %s", deduped)
+	}
+
+	unchanged := []byte(`{"input":[{"type":"message","role":"user","content":"hello"}]}`)
+	if got := EnsureCodexCompactionTriggerIsFinal(unchanged); string(got) != string(unchanged) {
+		t.Fatalf("request without a trigger was rewritten: %s", got)
+	}
+}
+
 func TestSanitizeCodexInputItemIDsBoundaries(t *testing.T) {
 	id64 := strings.Repeat("a", 64)
 	id65 := strings.Repeat("b", 65)
