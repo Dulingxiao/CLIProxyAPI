@@ -87,6 +87,40 @@ func TestCoordinatorFIFOAndOwnerPromotion(t *testing.T) {
 	}
 }
 
+func TestCoordinatorPromotionSkipsCalibrationRequiredCandidates(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC)}
+	store := &failAfterStore{failAfter: 1 << 30}
+	c := enabledCoordinator(t, clock, store)
+	for _, id := range []string{"owner", "head", "tail"} {
+		if errRegister := c.RegisterAuth(id, 1, 0); errRegister != nil {
+			t.Fatal(errRegister)
+		}
+	}
+	_ = c.ObserveThreshold("owner", 1, 99_000_000)
+	clock.now = clock.now.Add(time.Second)
+	_ = c.ObserveThreshold("head", 1, 99_000_000)
+	clock.now = clock.now.Add(time.Second)
+	_ = c.ObserveThreshold("tail", 1, 99_000_000)
+
+	// Restarting marks every persisted non-normal record as calibration-required.
+	restarted := enabledCoordinator(t, clock, store)
+	if errRecover := restarted.ConfirmRecovery("owner", 1); errRecover != nil {
+		t.Fatal(errRecover)
+	}
+	if got := restarted.Owner(); got != "" {
+		t.Fatalf("owner = %q, want empty while all candidates need calibration", got)
+	}
+	if errCalibrate := restarted.ConfirmCalibration("tail", 1); errCalibrate != nil {
+		t.Fatal(errCalibrate)
+	}
+	if got := restarted.Record("tail").State; got != StateActiveDrain {
+		t.Fatalf("tail state = %s, want ACTIVE_DRAIN past uncalibrated head", got)
+	}
+	if head := restarted.Record("head"); head.State != StateCandidate || !head.CalibrationRequired {
+		t.Fatalf("head record = %#v, want calibration-required candidate", head)
+	}
+}
+
 func TestCoordinatorExposesCandidateAndDrainCycleMetrics(t *testing.T) {
 	clock := &fakeClock{now: time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)}
 	c := enabledCoordinator(t, clock, nil)

@@ -1013,6 +1013,7 @@ func (m *Manager) scheduleCodexQuotaAfterResult(runtime *codexQuotaRuntime, auth
 			runtime.errorSteps[authID]++
 		}
 		runtime.mu.Unlock()
+		logEntryWithRequestID(nil).WithField("auth_id", authID).WithField("retry_in", delay.String()).WithError(errQuery).Warn("active Codex quota query failed")
 		m.scheduleCodexQuotaRefreshWithRuntime(runtime, authID, delay)
 		return
 	}

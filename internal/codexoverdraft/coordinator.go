@@ -723,23 +723,25 @@ func (c *Coordinator) promoteLocked() {
 	if !c.config.Enabled || c.state.Owner != "" {
 		return
 	}
-	candidates := candidatesFromRecords(c.state.Records)
-	if len(candidates) == 0 {
+	for _, candidate := range candidatesFromRecords(c.state.Records) {
+		// A candidate that still needs calibration must not block calibrated
+		// candidates queued behind it: restarts mark every persisted candidate
+		// as calibration-required, and one auth with persistently failing
+		// quota queries would otherwise stall the whole pool indefinitely.
+		if candidate.CalibrationRequired {
+			continue
+		}
+		if candidate.InheritedInFlight > c.config.MaxInFlight || candidate.InheritedInFlight > c.effectiveAuthMaxInFlightLocked(candidate) {
+			return
+		}
+		candidate.State = StateActiveDrain
+		candidate.StateEpoch++
+		candidate.DrainCycleID = randomID("drain_")
+		candidate.ProbeFailures = 0
+		c.state.Records[candidate.AuthID] = candidate
+		c.state.Owner = candidate.AuthID
 		return
 	}
-	head := candidates[0]
-	if head.CalibrationRequired {
-		return
-	}
-	if head.InheritedInFlight > c.config.MaxInFlight || head.InheritedInFlight > c.effectiveAuthMaxInFlightLocked(head) {
-		return
-	}
-	head.State = StateActiveDrain
-	head.StateEpoch++
-	head.DrainCycleID = randomID("drain_")
-	head.ProbeFailures = 0
-	c.state.Records[head.AuthID] = head
-	c.state.Owner = head.AuthID
 }
 
 func (c *Coordinator) effectiveAuthMaxInFlightLocked(record Record) int {
