@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -381,6 +382,68 @@ func TestManagerActiveQuotaRefreshParsesUsageWithoutTokenAccounting(t *testing.T
 	}
 	if snapshot.Source != codexoverdraft.QuotaSourceActive || len(snapshot.Windows) != 1 || snapshot.Windows[0].UsedMicropct != 42_000_000 {
 		t.Fatalf("snapshot = %#v", snapshot)
+	}
+}
+
+func TestManagerActiveQuotaStaleMergeStillConfirmsCalibration(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	defer m.StopCodexQuota()
+	executor := &quotaTestExecutor{body: `{"rate_limit":{"allowed":false,"limit_reached":true,"primary_window":{"used_percent":100,"limit_window_seconds":604800,"reset_at":1999999999}}}`}
+	m.RegisterExecutor(executor)
+	quota := internalconfig.DefaultCodexQuotaConfig()
+	quota.MinActiveInterval = "1ms"
+	m.SetConfig(quotaRuntimeConfigForTest(t, quota))
+	auth := fileCodexAuth("auth-stale-merge")
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	if _, errRefresh := m.RefreshCodexQuota(context.Background(), auth.ID); errRefresh != nil {
+		t.Fatal(errRefresh)
+	}
+
+	// Recreate the restart wedge: a persisted candidate reopens as
+	// calibration-required while upstream keeps answering with a reset_at one
+	// second earlier than the stored window, which the merge gate rejects.
+	generation := m.codexAuthGeneration(auth.ID)
+	storePath := filepath.Join(t.TempDir(), "overdraft.db")
+	config := codexoverdraft.CoordinatorConfig{Enabled: true, ThresholdMicropct: 98_000_000, MaxInFlight: 40, ExhaustionProbeFailures: 10}
+	seedStore, errStore := codexoverdraft.OpenBoltStore(storePath)
+	if errStore != nil {
+		t.Fatal(errStore)
+	}
+	seed, errSeed := codexoverdraft.NewCoordinator(config, seedStore, nil)
+	if errSeed != nil {
+		t.Fatal(errSeed)
+	}
+	if errRegisterAuth := seed.RegisterAuth(auth.ID, generation, 0); errRegisterAuth != nil {
+		t.Fatal(errRegisterAuth)
+	}
+	if errObserve := seed.ObserveThreshold(auth.ID, generation, 99_000_000); errObserve != nil {
+		t.Fatal(errObserve)
+	}
+	if errClose := seedStore.Close(); errClose != nil {
+		t.Fatal(errClose)
+	}
+	restartStore, errReopen := codexoverdraft.OpenBoltStore(storePath)
+	if errReopen != nil {
+		t.Fatal(errReopen)
+	}
+	t.Cleanup(func() { _ = restartStore.Close() })
+	coordinator, errRestart := codexoverdraft.NewCoordinator(config, restartStore, nil)
+	if errRestart != nil {
+		t.Fatal(errRestart)
+	}
+	m.SetCodexOverdraftCoordinator(coordinator)
+	if record := coordinator.Record(auth.ID); record.State != codexoverdraft.StateActiveDrain || !record.CalibrationRequired {
+		t.Fatalf("record after restart = %#v, want calibration-required active drain", record)
+	}
+
+	executor.body = `{"rate_limit":{"allowed":false,"limit_reached":true,"primary_window":{"used_percent":100,"limit_window_seconds":604800,"reset_at":1999999998}}}`
+	if _, errStale := m.RefreshCodexQuota(context.Background(), auth.ID); errStale != nil {
+		t.Fatalf("stale-merge refresh error = %v, want nil", errStale)
+	}
+	if record := coordinator.Record(auth.ID); record.CalibrationRequired {
+		t.Fatalf("record after stale-merge refresh = %#v, want calibration cleared", record)
 	}
 }
 

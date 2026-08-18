@@ -886,7 +886,16 @@ func (m *Manager) queryCodexQuota(runtime *codexQuotaRuntime, authID string, gen
 			return codexoverdraft.QuotaSnapshot{}, fmt.Errorf("persist stale active Codex quota response: %w", errPersist)
 		}
 		m.recordCodexQuotaPersistenceResult(nil)
-		return codexoverdraft.QuotaSnapshot{}, fmt.Errorf("active Codex quota response was stale")
+		if snapshot.AuthGeneration != currentGeneration || snapshot.Inconsistent {
+			return codexoverdraft.QuotaSnapshot{}, fmt.Errorf("active Codex quota response was stale")
+		}
+		// The merge gate keeps the stored windows when upstream reports an
+		// equal-or-older view (reset timestamps can wobble backwards a few
+		// seconds between queries). The query itself still succeeded, so the
+		// lifecycle decisions below must run: dropping them left restarted
+		// calibration-required candidates stuck outside the overdraft pool.
+		m.applyActiveCodexQuotaSnapshot(snapshot)
+		return snapshot, nil
 	}
 	m.recordCodexQuotaPersistenceResult(nil)
 	m.codexQuotaMu.Lock()
