@@ -19,6 +19,23 @@ import (
 
 const officialCodexBaseURL = "https://chatgpt.com/backend-api/codex"
 
+// codexOverdraftRejectLogTimes throttles per-reason admission rejection logs
+// so a busy fleet cannot flood the log while the cause stays observable.
+var codexOverdraftRejectLogTimes sync.Map
+
+func logCodexOverdraftRejection(reason, ownerID, model string) {
+	now := time.Now().UnixNano()
+	if last, ok := codexOverdraftRejectLogTimes.Load(reason); ok && now-last.(int64) < int64(30*time.Second) {
+		return
+	}
+	codexOverdraftRejectLogTimes.Store(reason, now)
+	logEntryWithRequestID(nil).
+		WithField("reason", reason).
+		WithField("owner_auth_id", ownerID).
+		WithField("model", model).
+		Warn("codex overdraft admission rejected the drain owner")
+}
+
 func (m *Manager) applyCodexOverdraftConfig(cfg *internalconfig.Config) error {
 	if m == nil || cfg == nil {
 		return nil
@@ -350,9 +367,11 @@ func (m *Manager) acquireCodexOverdraftExecution(providers []string, req cliprox
 		return nil, nil, false
 	}
 	if _, alreadyTried := tried[owner]; alreadyTried {
+		logCodexOverdraftRejection("owner_already_tried", owner, req.Model)
 		return nil, nil, false
 	}
 	if pinned := pinnedAuthIDFromMetadata(opts.Metadata); pinned != "" && pinned != owner {
+		logCodexOverdraftRejection("pinned_to_other_auth", owner, req.Model)
 		return nil, nil, false
 	}
 	// Compatible traffic already chose the drain owner. Any miss must keep
@@ -370,15 +389,17 @@ func (m *Manager) acquireCodexOverdraftExecution(providers []string, req cliprox
 	}
 	m.mu.RUnlock()
 	if !isCodexOverdraftEligibleAuth(auth) || auth.Disabled || auth.Status == StatusDisabled {
+		logCodexOverdraftRejection("owner_auth_ineligible", owner, req.Model)
 		rejectOwner()
 		return nil, nil, false
 	}
-	blocked, _, _ := isAuthBlockedForModel(auth, req.Model, time.Now())
+	blocked, blockedReason, _ := isAuthBlockedForModel(auth, req.Model, time.Now())
 	lateAdmission := false
 	lateAdmissionMaxAttempts := 0
 	if blocked {
 		lateAdmission, lateAdmissionMaxAttempts = m.canBypassLateCodexUsageLimitCooldown(auth, req.Model, coordinator)
 		if !lateAdmission {
+			logCodexOverdraftRejection(fmt.Sprintf("owner_blocked_reason_%d_no_late_admission", blockedReason), owner, req.Model)
 			rejectOwner()
 			return nil, nil, false
 		}
@@ -391,6 +412,7 @@ func (m *Manager) acquireCodexOverdraftExecution(providers []string, req cliprox
 		lease, errAcquire = coordinator.AcquireBusiness(dispatchIDFromOptions(opts))
 	}
 	if errAcquire != nil {
+		logCodexOverdraftRejection("lease_denied: "+errAcquire.Error(), owner, req.Model)
 		rejectOwner()
 		return nil, nil, false
 	}
