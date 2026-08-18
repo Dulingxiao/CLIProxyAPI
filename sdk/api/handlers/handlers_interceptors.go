@@ -245,7 +245,7 @@ func finalInterceptorHeaders(current, intercepted http.Header) http.Header {
 
 func downstreamHeadersFromExecutor(headers http.Header, passthrough bool) http.Header {
 	if !passthrough {
-		return nil
+		return ProtocolResponseHeaders(headers)
 	}
 	return FilterUpstreamHeaders(headers)
 }
@@ -254,7 +254,18 @@ func downstreamHeadersAfterInterceptors(baseRaw, finalRaw http.Header, passthrou
 	if passthrough {
 		return FilterUpstreamHeaders(finalRaw)
 	}
-	return FilterUpstreamHeaders(diffHeaders(baseRaw, finalRaw))
+	changed := FilterUpstreamHeaders(diffHeaders(baseRaw, finalRaw))
+	protocol := ProtocolResponseHeaders(finalRaw)
+	if protocol == nil {
+		return changed
+	}
+	if changed == nil {
+		changed = make(http.Header)
+	}
+	for key, values := range protocol {
+		changed[key] = append([]string(nil), values...)
+	}
+	return changed
 }
 
 func diffHeaders(base, next http.Header) http.Header {

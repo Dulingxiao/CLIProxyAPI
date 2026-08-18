@@ -138,9 +138,74 @@ CLIProxyAPI Guides: [https://help.router-for.me/](https://help.router-for.me/)
 
 see [MANAGEMENT_API.md](https://help.router-for.me/management/api)
 
+## Codex Quota, Overdraft Pool, and Accounting
+
+Official file-backed Codex OAuth credentials can use built-in quota observation, an optional FIFO overdraft pool, and a durable per-auth accounting ledger. Runtime state and APIs use the auth file ID (`auth_id`) as the primary key.
+
+```yaml
+codex:
+  fingerprint-mode: off # off | device | session | full
+  tls-profile: chrome # chrome | safari-like | go-standard
+  tls-reuse-connections: true # scoped by (Auth, proxy)
+  quota:
+    enabled: true
+    stale-after: 10m
+    near-threshold-stale-after: 60s
+    min-active-interval: 60s
+    startup-jitter: 30s
+    active-query-concurrency: 8
+  overdraft:
+    enabled: false
+    quota-threshold-percent: "98"
+    arm-threshold-percent: "90"
+    max-in-flight: 40
+    per-auth-max-in-flight: 0 # 0 inherits the global limit
+    late-admission-bypass-cooldown: true
+    late-admission-max-attempts: 3
+    allow-credit-spend: false
+    exhaustion-probe-failures: 10
+    probe-min-interval: 1s
+    probe-model: "gpt-5.3-codex"
+
+accounting:
+  enabled: false
+  storage-path: "AUTH_STATE_DIR/accounting.db"
+```
+
+- Active `/backend-api/wham/usage` queries are the quota source of truth; allowlisted response headers are opportunistic input. Polling accelerates near the threshold and enforces `min-active-interval` per auth.
+- At the threshold, accounts enter a strict first-in-first-out candidate queue. One account at a time becomes the active overdraft owner. Candidates stay in ordinary round-robin; only `EXHAUSTED` and overlay `DISABLED` leave it. Compatible traffic takes a drain lease first and overflows to `NORMAL`/`CANDIDATE` on a miss so `max-in-flight` is not bypassed. `max-in-flight` is the global Overlay ceiling; `per-auth-max-in-flight` is the independent owner ceiling and can be overridden with Auth attribute `codex_overdraft_max_in_flight`.
+- Paid-credit consumption is excluded by default when a window is full. `allow-credit-spend: true` explicitly enables it and accounting tags those events as `over_window_on_credits`.
+- Official ChatGPT transport supports `chrome`, `safari-like`, and `go-standard` A-B profiles. Connection and TLS-session reuse never crosses Auth or proxy scope.
+- Every overdraft upstream send appends the adjacent `zz` function call/output pair to the final Codex body. Both `arguments` and `output` are the string `"{}"`; retries receive new attempt and call IDs.
+- After an account is the overdraft owner, ten consecutive typed `usage_limit_reached` 429s on business traffic move it to `EXHAUSTED`. A later non-limit result resets that streak. A confirmed quota recovery always returns it to `NORMAL`.
+- Accounting persists pre-send intents, immutable usage parts, attempt closures, price versions, and price results. Pricing runs asynchronously and distinguishes reported zero usage from missing usage.
+- Terminal usage persistence is synchronous. A durable ledger fault returns a request-scoped `503` after a completed non-stream response and pauses subsequent Codex admission until restart/reconciliation; it does not replay completed work through another credential. A durable quota-store fault pauses only the overdraft overlay, while ordinary scheduling remains available and a successful durable quota observation rebuilds a fresh overlay epoch.
+- Setting `codex.overdraft.enabled: false` removes the candidate, active, verifying, and exhausted overlays. Quota collection and accounting remain independently available.
+- Codex application-identity convergence is separately opt-in. `off` preserves the client's application identity, `device` converges only the installation identity, `session` also converges the account session while deriving a thread from the inbound client session, and `full` converges the account thread as well. Per-auth `codex_fingerprint_mode` and `openai_device_id` attributes override the global setting.
+- `X-Codex-Turn-State` is always relayed as required protocol state. Its provenance is tracked per caller, client session, and opaque state value; a known state minted by another selected auth is stripped on failover, while same-auth and unknown state are preserved.
+
+Management endpoints are under `/v0/management`: `/codex/overdraft/status`, `/codex/overdraft/enabled`, `/codex/quota`, `/codex/quota/health`, `/codex/quota/:auth_id/refresh`, `/accounting/health`, `/accounting/events`, `/accounting/costs`, `/accounting/aggregate`, `/accounting/aggregates`, and `/model-pricing` (including `/reprice`). Event and cost pages accept `auth_id`, `provider`, `model`, `tier`, `drain_cycle_id`, RFC3339 `from`/`to`, `offset`, and `limit` (maximum 500); cost pages also accept `cost_status`, `price_version_id`, and `pricing_run_id`.
+
+Model prices are immutable effective-dated versions. The five `*_nano_usd_per_million` fields are nano-USD per one million tokens (`1 USD = 1,000,000,000 nano-USD`):
+
+```json
+{
+  "model": "gpt-5.3-codex",
+  "tier": "default",
+  "effective_from": "2026-08-16T00:00:00Z",
+  "input_nano_usd_per_million": 1250000000,
+  "cache_read_nano_usd_per_million": 125000000,
+  "cache_write_nano_usd_per_million": 0,
+  "output_nano_usd_per_million": 10000000000,
+  "reasoning_nano_usd_per_million": 10000000000
+}
+```
+
+Create a version with `PUT /v0/management/model-pricing`; list versions with `GET` on the same path, and rebuild historical immutable cost results with `POST /v0/management/model-pricing/reprice`.
+
 ## Usage Statistics
 
-Since v6.10.0, CLIProxyAPI and [CPAMC](https://github.com/router-for-me/Cli-Proxy-API-Management-Center) no longer ship built-in usage statistics. If you need usage statistics, use:
+The optional accounting ledger above provides durable request/token/cost data for the Codex auth pool. CLIProxyAPI and [CPAMC](https://github.com/router-for-me/Cli-Proxy-API-Management-Center) still do not bundle a general-purpose statistics dashboard; for broader visualization, use:
 
 ### [CPA Usage Keeper](https://github.com/Willxup/cpa-usage-keeper)
 

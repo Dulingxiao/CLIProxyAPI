@@ -345,7 +345,14 @@ func (s *Service) Shutdown(ctx context.Context) error {
 			}
 		}
 
+		if s.coreManager != nil {
+			s.coreManager.StopCodexQuota()
+			s.coreManager.CloseCodexOverdraft()
+		}
 		usage.StopDefault()
+		if s.coreManager != nil {
+			s.coreManager.CloseAccounting()
+		}
 	})
 	return shutdownErr
 }

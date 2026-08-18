@@ -78,15 +78,20 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	if errPromptCache != nil {
 		return nil, errPromptCache
 	}
+	body, err = helps.PrepareCodexOverdraftBody(body, opts)
+	if err != nil {
+		return nil, err
+	}
 	clientBody := body
 	var identityState codexIdentityConfuseState
 	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, body)
-	upstreamBody, identityState.application = applyCodexOfficialApplicationIdentity(e.cfg, auth, wsURL, upstreamBody)
+	upstreamBody, identityState.application = applyCodexOfficialApplicationIdentity(e.cfg, auth, wsURL, upstreamBody, opts.Headers)
 	upstreamBody = normalizeCodexUpstreamRequestMetadata(auth, wsURL, upstreamBody)
 	reporter.SetTranslatedReasoningEffort(clientBody, to.String())
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
 	applyModelHeaderOverrides(wsHeaders, baseModel)
 	applyCodexIdentityConfuseHeaders(wsHeaders, &identityState)
+	applyCodexTurnStateClear(wsHeaders, opts)
 
 	var authID, authLabel, authType, authValue string
 	authID = auth.ID
@@ -176,6 +181,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		return nil, errBind
 	}
 	recordAPIWebsocketHandshake(ctx, e.cfg, respHS)
+	if respHS != nil {
+		helps.PublishCodexQuotaHeaders(opts, authID, respHS.Header)
+	}
 	reporter.StartResponseTTFT()
 
 	if sess == nil {
@@ -188,6 +196,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	}
 	restoreMultiAgentV2 := !multiAgentV2Conflict && (optimizeMultiAgentV2 || sess.isMultiAgentV2Optimized(conn))
 
+	if errBegin := helps.BeginCodexOverdraftSend(opts); errBegin != nil {
+		return nil, errBegin
+	}
 	if errSend := writeCodexWebsocketMessage(sess, conn, wsReqBody); errSend != nil {
 		errSend = mapCodexWebsocketWriteError(sess, conn, errSend)
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "send", errSend)
@@ -228,7 +239,23 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 			readCh = sess.activate(conn)
 			restoreMultiAgentV2 = !multiAgentV2Conflict && (optimizeMultiAgentV2 || sess.isMultiAgentV2Optimized(conn))
-			wsReqBodyRetry := buildCodexWebsocketRequestBody(upstreamBody)
+			upstreamBodyRetry, errRefreshInjection := helps.RefreshCodexOverdraftInjection(upstreamBody, opts)
+			if errRefreshInjection != nil {
+				sess.clearActive(conn, readCh)
+				sess.reqMu.Unlock()
+				return nil, errRefreshInjection
+			}
+			if errRetryIntent := helps.BeginCodexAccountingRetry(opts); errRetryIntent != nil {
+				sess.clearActive(conn, readCh)
+				sess.reqMu.Unlock()
+				return nil, errRetryIntent
+			}
+			if errBeginRetry := helps.BeginCodexOverdraftSend(opts); errBeginRetry != nil {
+				sess.clearActive(conn, readCh)
+				sess.reqMu.Unlock()
+				return nil, errBeginRetry
+			}
+			wsReqBodyRetry := buildCodexWebsocketRequestBody(upstreamBodyRetry)
 			helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 				URL:       wsURL,
 				Method:    "WEBSOCKET",
@@ -241,6 +268,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				AuthValue: authValue,
 			})
 			recordAPIWebsocketHandshake(ctx, e.cfg, respHSRetry)
+			if respHSRetry != nil {
+				helps.PublishCodexQuotaHeaders(opts, authID, respHSRetry.Header)
+			}
 			reporter.StartResponseTTFT()
 			if errSendRetry := writeCodexWebsocketMessage(sess, conn, wsReqBodyRetry); errSendRetry != nil {
 				errSendRetry = mapCodexWebsocketWriteError(sess, conn, errSendRetry)
@@ -396,7 +426,14 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				completedPayload = patchCodexCompletedOutput(completedPayload, outputItemsByIndex, outputItemsFallback)
 				cacheCodexReasoningReplayFromCompleted(replayScope, completedPayload)
 				if detail, ok := helps.ParseCodexUsage(completedPayload); ok {
-					reporter.Publish(ctx, detail)
+					if errUsage := reporter.Publish(ctx, detail); errUsage != nil {
+						_ = send(cliproxyexecutor.StreamChunk{Err: cliproxyexecutor.NewUsagePersistenceError(errUsage)})
+						return
+					}
+				}
+				if errUsage := reporter.EnsurePublished(ctx); errUsage != nil {
+					_ = send(cliproxyexecutor.StreamChunk{Err: cliproxyexecutor.NewUsagePersistenceError(errUsage)})
+					return
 				}
 			}
 

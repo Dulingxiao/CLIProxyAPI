@@ -55,7 +55,17 @@ func newCodexWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth, wsURL 
 		log.Errorf("codex websockets executor: resolve fingerprint proxy failed: %v", errProxy)
 		return dialer
 	}
-	dialTLSContext, errDialer := helps.NewUTLSWebsocketDialContext(proxyURL)
+	profile := helps.CodexTLSProfileForAuth(cfg, auth)
+	if profile == config.CodexTLSProfileGoStandard {
+		return dialer
+	}
+	authID := ""
+	if auth != nil {
+		authID = strings.TrimSpace(auth.ID)
+	}
+	reuse := cfg == nil || cfg.Codex.TLSReuseConnections
+	cacheKey := strings.Join([]string{authID, proxyURL, profile}, "\x00")
+	dialTLSContext, errDialer := helps.NewUTLSWebsocketDialContextForProfile(proxyURL, profile, cacheKey, reuse)
 	if errDialer != nil {
 		log.Errorf("codex websockets executor: create fingerprint TLS dialer failed: %v", errDialer)
 		return dialer

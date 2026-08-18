@@ -145,7 +145,7 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 	if identityState.promptCacheKey != "" {
 		cache.ID = identityState.promptCacheKey
 	}
-	rawJSON, identityState.application = applyCodexOfficialApplicationIdentity(e.cfg, auth, url, rawJSON)
+	rawJSON, identityState.application = applyCodexOfficialApplicationIdentity(e.cfg, auth, url, rawJSON, headers)
 	rawJSON = normalizeCodexUpstreamRequestMetadata(auth, url, rawJSON)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(rawJSON))
 	if err != nil {
@@ -349,6 +349,7 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 		r.Header.Set("X-Codex-Beta-Features", ginHeaders.Get("X-Codex-Beta-Features"))
 	}
 	misc.EnsureHeader(r.Header, ginHeaders, "Version", "")
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-State", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-Metadata", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Window-Id", "")
@@ -390,6 +391,12 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 	}
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
 	applyCodexCloakingHeaders(r.Header, cfg)
+}
+
+func applyCodexTurnStateClear(headers http.Header, opts cliproxyexecutor.Options) {
+	if headers != nil && cliproxyexecutor.CodexTurnStateClearFromOptions(opts) {
+		headers.Del("X-Codex-Turn-State")
+	}
 }
 
 func applyCodexCloakingHeaders(headers http.Header, cfg *config.Config) {
@@ -502,13 +509,15 @@ func normalizeCodexParallelToolCallsForTools(body []byte) []byte {
 	return body
 }
 
-func publishCodexImageToolUsage(ctx context.Context, reporter *helps.UsageReporter, body []byte, completedData []byte) {
+func publishCodexImageToolUsage(ctx context.Context, reporter *helps.UsageReporter, body []byte, completedData []byte) error {
 	detail, ok := helps.ParseCodexImageToolUsage(completedData)
 	if !ok {
-		return
+		return nil
 	}
-	reporter.EnsurePublished(ctx)
-	reporter.PublishAdditionalModel(ctx, codexImageGenerationToolModel(body), detail)
+	if errPublish := reporter.EnsurePublished(ctx); errPublish != nil {
+		return errPublish
+	}
+	return reporter.PublishAdditionalModel(ctx, codexImageGenerationToolModel(body), detail)
 }
 
 func codexImageGenerationToolModel(body []byte) string {

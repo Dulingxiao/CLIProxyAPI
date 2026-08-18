@@ -248,11 +248,15 @@ func preferCodexWebsocketAuths(ctx context.Context, provider string, available [
 	return available
 }
 
-func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (available map[int][]*Auth, cooldownCount int, earliest time.Time) {
+func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (available map[int][]*Auth, cooldownCount, liveCount int, earliest time.Time) {
 	available = make(map[int][]*Auth)
 	for i := 0; i < len(auths); i++ {
 		candidate := auths[i]
 		blocked, reason, next := isAuthBlockedForModel(candidate, model, now)
+		if reason == blockReasonDisabled {
+			continue
+		}
+		liveCount++
 		if !blocked {
 			priority := authPriority(candidate)
 			available[priority] = append(available[priority], candidate)
@@ -265,7 +269,7 @@ func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (ava
 			}
 		}
 	}
-	return available, cooldownCount, earliest
+	return available, cooldownCount, liveCount, earliest
 }
 
 func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
@@ -281,9 +285,9 @@ func getAvailableAuthsWithPriorityMode(auths []*Auth, provider, model string, no
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
 
-	availableByPriority, cooldownCount, earliest := collectAvailableByPriority(auths, model, now)
+	availableByPriority, cooldownCount, liveCount, earliest := collectAvailableByPriority(auths, model, now)
 	if len(availableByPriority) == 0 {
-		if cooldownCount == len(auths) && !earliest.IsZero() {
+		if liveCount > 0 && cooldownCount == liveCount && !earliest.IsZero() {
 			providerForError := provider
 			if providerForError == "mixed" {
 				providerForError = ""
@@ -541,6 +545,12 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if auth.Disabled || auth.Status == StatusDisabled {
 		return true, blockReasonDisabled, time.Time{}
 	}
+	// Credit protection is account-scoped and must remain absorbing even when
+	// per-model states exist. Other auth-level aggregation continues to use the
+	// historical per-model precedence below.
+	if auth.Quota.Exceeded && strings.EqualFold(strings.TrimSpace(auth.Quota.Reason), "credit_protection") {
+		return availabilityBlock(auth.Unavailable, true, auth.NextRetryAfter, auth.Quota.NextRecoverAt, now)
+	}
 	if model != "" {
 		if len(auth.ModelStates) > 0 {
 			modelKey := canonicalModelKey(model)
@@ -548,6 +558,7 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 			blocked := false
 			blockedReason := blockReasonNone
 			nextRetry := time.Time{}
+			sawCooldown := false
 			for stateModel, state := range auth.ModelStates {
 				if state == nil || canonicalModelKey(stateModel) != modelKey {
 					continue
@@ -560,6 +571,9 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 				if !stateBlocked {
 					continue
 				}
+				if reason == blockReasonCooldown {
+					sawCooldown = true
+				}
 				if next.IsZero() {
 					return true, reason, time.Time{}
 				}
@@ -570,6 +584,12 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 				}
 			}
 			if matched {
+				// Cooldown classification is absorbing across canonical model aliases.
+				// The retry time remains the latest blocking deadline, so callers get
+				// a useful quota classification without weakening conservative timing.
+				if sawCooldown && blocked {
+					blockedReason = blockReasonCooldown
+				}
 				return blocked, blockedReason, nextRetry
 			}
 			// Auth-level availability can aggregate failures from other models.

@@ -5,7 +5,7 @@ The `sdk/cliproxy` module exposes the proxy as a reusable Go library so external
 ## Install & Import
 
 ```bash
-go get github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy
+go get github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy
 ```
 
 ```go
@@ -14,12 +14,12 @@ import (
     "errors"
     "time"
 
-    "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-    "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy"
+    "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy"
+    "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
 ```
 
-Note the `/v6` module path.
+Note the `/v7` module path.
 
 ## Minimal Embed
 
@@ -75,6 +75,35 @@ These options mirror the internals used by the CLI server.
 - Management endpoints are mounted only when `remote-management.secret-key` is set in `config.yaml`.
 - Remote access additionally requires `remote-management.allow-remote: true`.
 - See MANAGEMENT_API.md for endpoints. Your embedded server exposes them under `/v0/management` on the configured port.
+
+## Codex Quota, Overdraft, and Accounting
+
+These services are configured on the same `config.Config` passed to the builder. File loading supplies defaults; when constructing a config directly, start from the exported default helpers:
+
+```go
+quota := config.DefaultCodexQuotaConfig()
+
+overdraft := config.DefaultCodexOverdraftConfig()
+overdraft.Enabled = true
+overdraft.ProbeModel = "gpt-5.3-codex"
+
+ledger := config.DefaultAccountingConfig()
+ledger.Enabled = true
+
+cfg.Codex.Quota = quota
+cfg.Codex.Overdraft = overdraft
+cfg.Accounting = ledger
+```
+
+Overdraft enablement requires quota collection, accounting, and a probe model. The manager applies dependency shutdown in order: it closes overdraft admission first, then drains accounting and stops quota scheduling. Cancelling `Service.Run` also drains the built-in usage queue before the ledger is closed.
+
+Quota response observations are submitted to a bounded, per-auth ordered background path; business requests do not wait for active quota queries or price calculations. Durable Attempt Intents are written immediately before Codex network sends, and terminal Usage Parts are durably written synchronously before usage delivery returns; only pricing runs asynchronously. Accounting storage defaults to `AUTH_STATE_DIR/accounting.db`; overdraft coordination and quota history use the companion `<base>-overdraft.db` and `<base>-quota.db` files.
+
+Accounting write faults are admission-blocking and remain sticky until the service is restarted and reconciled; a post-completion persistence error is request-scoped, so completed upstream work is not replayed through another credential. Quota-store write faults instead close only the overdraft overlay and are exposed by `CodexQuotaRuntimeHealth()` and `GET /v0/management/codex/quota/health`; ordinary scheduling remains available. Event/cost management pages support Auth.ID, provider, model, tier, drain cycle, RFC3339 `[from,to)`, and bounded pagination filters.
+
+`codex.fingerprint-mode` defaults to `off`. The `device`, `session`, and `full` modes progressively converge official Codex application identity; per-auth `codex_fingerprint_mode` and `openai_device_id` attributes override the global setting. Turn-state provenance remains independent: known cross-auth `X-Codex-Turn-State` values are removed during failover and the final upstream state is relayed downstream even when general header passthrough is disabled.
+
+The core manager exposes `CodexOverdraftCoordinator()`, `CodexQuotaSnapshot(s)`, `CodexQuotaRuntimeHealth()`, `RefreshCodexQuota`, and `AccountingService()` for embedded operator integrations. Runtime records and management filters use `Auth.ID` only.
 
 ## Using the Core Auth Manager
 

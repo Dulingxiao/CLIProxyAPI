@@ -1,11 +1,11 @@
 package executor
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -14,12 +14,21 @@ import (
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
+	"golang.org/x/net/http/httpguts"
 )
 
-const codexApplicationWindowTTL = time.Hour
+type codexFingerprintMode string
+
+const (
+	codexFingerprintOff     codexFingerprintMode = "off"
+	codexFingerprintDevice  codexFingerprintMode = "device"
+	codexFingerprintSession codexFingerprintMode = "session"
+	codexFingerprintFull    codexFingerprintMode = "full"
+)
 
 type codexApplicationIdentity struct {
 	enabled          bool
+	mode             codexFingerprintMode
 	profile          registry.CodexFingerprintProfile
 	installationID   string
 	sessionID        string
@@ -32,63 +41,70 @@ type codexApplicationIdentity struct {
 	parentTurnID     string
 	subagentKind     string
 	turnMetadataJSON string
+	userAgent        string
+	attestation      string
+	residency        string
 	websocket        bool
 }
-
-type codexApplicationWindowEntry struct {
-	id        string
-	expiresAt time.Time
-}
-
-var codexApplicationWindows = struct {
-	sync.Mutex
-	entries map[string]codexApplicationWindowEntry
-}{entries: make(map[string]codexApplicationWindowEntry)}
 
 func applyCodexOfficialApplicationIdentity(
 	cfg *config.Config,
 	auth *cliproxyauth.Auth,
 	requestURL string,
 	body []byte,
+	clientHeaderSets ...http.Header,
 ) ([]byte, codexApplicationIdentity) {
-	if !codexOfficialFingerprintScope(cfg, auth, requestURL) || len(body) == 0 {
+	mode := codexFingerprintModeForRequest(cfg, auth)
+	if !codexOfficialFingerprintScope(cfg, auth, requestURL) {
 		return body, codexApplicationIdentity{}
 	}
-
 	profile := registry.GetCodexFingerprintProfile()
+	if cfg != nil && cfg.Codex.DisableCodexCloaking {
+		mode = codexFingerprintOff
+	}
+	var clientHeaders http.Header
+	if len(clientHeaderSets) > 0 {
+		clientHeaders = clientHeaderSets[0]
+	}
+	baseIdentity := codexApplicationIdentity{
+		enabled:     true,
+		mode:        mode,
+		profile:     profile,
+		userAgent:   codexUserAgentForAuth(profile, auth),
+		attestation: strings.TrimSpace(headerValueCaseInsensitive(clientHeaders, profile.Headers.Attestation)),
+		residency:   strings.TrimSpace(headerValueCaseInsensitive(clientHeaders, profile.Headers.Residency)),
+		websocket:   codexApplicationIsWebsocket(requestURL),
+	}
+	if mode == codexFingerprintOff || len(body) == 0 {
+		return body, baseIdentity
+	}
+
 	authIdentity := strings.TrimSpace(auth.ID)
+	rawTurnMetadata := clientMetadataString(body, profile.Headers.TurnMetadata)
 	turnMetadata := parseCodexTurnMetadata(body, profile)
-
-	sessionSeed := clientMetadataString(body, profile.MetadataKeys.SessionID)
-	if sessionSeed == "" {
-		sessionSeed = strings.TrimSpace(gjson.GetBytes(body, "prompt_cache_key").String())
-	}
-	sessionID := stableCodexApplicationUUID(authIdentity, "session", sessionSeed)
-
-	threadSeed := clientMetadataString(body, profile.MetadataKeys.ThreadID)
-	if threadSeed == "" {
-		threadSeed = sessionSeed
-	}
-	threadID := stableCodexApplicationUUID(authIdentity, "thread", threadSeed)
-
-	installationSeed := clientMetadataString(body, profile.Headers.InstallationID)
-	if installationSeed == "" {
-		installationSeed = authIdentity
-	}
-	installationID := stableCodexApplicationUUID(authIdentity, "installation", installationSeed)
-
-	windowID := clientMetadataString(body, profile.Headers.WindowID)
-	if parsed, errParse := uuid.Parse(windowID); errParse != nil || parsed.Version() != 7 {
-		windowID = cachedCodexApplicationWindow(authIdentity, sessionID)
+	installationID := codexConvergedInstallationID(auth)
+	body = setCodexClientMetadataString(body, profile.Headers.InstallationID, installationID)
+	turnMetadata[profile.MetadataKeys.InstallationID] = installationID
+	if mode == codexFingerprintDevice {
+		turnMetadataJSON := ""
+		if rawTurnMetadata != "" {
+			turnMetadataJSONBytes, _ := json.Marshal(turnMetadata)
+			turnMetadataJSON = string(turnMetadataJSONBytes)
+			body = setCodexClientMetadataString(body, profile.Headers.TurnMetadata, turnMetadataJSON)
+		}
+		baseIdentity.installationID = installationID
+		baseIdentity.turnMetadataJSON = turnMetadataJSON
+		return body, baseIdentity
 	}
 
-	turnID := clientMetadataString(body, profile.MetadataKeys.TurnID)
-	if turnID == "" {
-		turnID, _ = turnMetadata[profile.MetadataKeys.TurnID].(string)
+	clientSessionSeed := codexFingerprintClientSessionID(clientHeaders)
+	sessionID := stableCodexApplicationUUID(authIdentity, "session", "")
+	threadID := sessionID
+	if mode == codexFingerprintSession && clientSessionSeed != "" {
+		threadID = stableCodexApplicationUUID(authIdentity, "thread", clientSessionSeed)
 	}
-	if parsed, errParse := uuid.Parse(turnID); errParse != nil || parsed.Version() != 7 {
-		turnID = newCodexUUIDv7()
-	}
+	turnID := newCodexUUIDv7()
+	windowID := threadID + ":0"
 
 	parentThreadID := clientMetadataString(body, profile.Headers.ParentThreadID)
 	if parentThreadID == "" {
@@ -109,7 +125,6 @@ func applyCodexOfficialApplicationIdentity(
 		turnStartedAtMS = int64(existing)
 	}
 
-	turnMetadata[profile.MetadataKeys.InstallationID] = installationID
 	turnMetadata[profile.MetadataKeys.SessionID] = sessionID
 	turnMetadata[profile.MetadataKeys.ThreadID] = threadID
 	turnMetadata[profile.MetadataKeys.TurnID] = turnID
@@ -128,7 +143,6 @@ func applyCodexOfficialApplicationIdentity(
 	turnMetadataJSONBytes, _ := json.Marshal(turnMetadata)
 	turnMetadataJSON := string(turnMetadataJSONBytes)
 
-	body = setCodexClientMetadataString(body, profile.Headers.InstallationID, installationID)
 	body = setCodexClientMetadataString(body, profile.MetadataKeys.SessionID, sessionID)
 	body = setCodexClientMetadataString(body, profile.MetadataKeys.ThreadID, threadID)
 	body = setCodexClientMetadataString(body, profile.MetadataKeys.TurnID, turnID)
@@ -146,6 +160,7 @@ func applyCodexOfficialApplicationIdentity(
 
 	return body, codexApplicationIdentity{
 		enabled:          true,
+		mode:             mode,
 		profile:          profile,
 		installationID:   installationID,
 		sessionID:        sessionID,
@@ -158,6 +173,9 @@ func applyCodexOfficialApplicationIdentity(
 		parentTurnID:     parentTurnID,
 		subagentKind:     subagentKind,
 		turnMetadataJSON: turnMetadataJSON,
+		userAgent:        baseIdentity.userAgent,
+		attestation:      baseIdentity.attestation,
+		residency:        baseIdentity.residency,
 		websocket:        codexApplicationIsWebsocket(requestURL),
 	}
 }
@@ -167,28 +185,94 @@ func applyCodexOfficialApplicationIdentityHeaders(headers http.Header, identity 
 		return
 	}
 	profile := identity.profile
-	headers.Set("User-Agent", profile.UserAgent())
+	headers.Set("User-Agent", identity.userAgent)
 	headers.Set("Originator", profile.Originator)
 	headers.Set("Version", profile.Version)
+	if identity.attestation != "" {
+		headers.Set(profile.Headers.Attestation, identity.attestation)
+	}
+	if identity.residency != "" {
+		headers.Set(profile.Headers.Residency, identity.residency)
+	}
 	if identity.websocket {
 		headers.Set("OpenAI-Beta", profile.WebsocketBeta)
 	}
-	setCodexSessionHeaderCasePreserved(headers, profile.Headers.SessionID, identity.sessionID)
-	setHeaderCasePreserved(headers, profile.Headers.ThreadID, identity.threadID)
-	if identity.websocket {
-		headers.Set(profile.Headers.ClientRequestID, identity.threadID)
+	if identity.mode == codexFingerprintOff {
+		return
 	}
-	headers.Set(profile.Headers.WindowID, identity.windowID)
-	headers.Set(profile.Headers.TurnMetadata, identity.turnMetadataJSON)
-	if identity.requestKind == "compaction" {
+	if codexProfileIncludesHeader(profile, identity.websocket, profile.Headers.InstallationID) {
 		headers.Set(profile.Headers.InstallationID, identity.installationID)
 	}
-	if identity.parentThreadID != "" {
+	if identity.mode == codexFingerprintDevice {
+		if identity.turnMetadataJSON != "" && codexProfileIncludesHeader(profile, identity.websocket, profile.Headers.TurnMetadata) {
+			headers.Set(profile.Headers.TurnMetadata, identity.turnMetadataJSON)
+		}
+		return
+	}
+	if codexProfileIncludesHeader(profile, identity.websocket, profile.Headers.SessionID) {
+		setCodexDualIdentityHeaders(headers, "session", identity.sessionID)
+	}
+	if codexProfileIncludesHeader(profile, identity.websocket, profile.Headers.ThreadID) {
+		setCodexDualIdentityHeaders(headers, "thread", identity.threadID)
+	}
+	if identity.websocket && codexProfileIncludesHeader(profile, true, profile.Headers.ClientRequestID) {
+		headers.Set(profile.Headers.ClientRequestID, identity.threadID)
+	}
+	if codexProfileIncludesHeader(profile, identity.websocket, profile.Headers.WindowID) {
+		headers.Set(profile.Headers.WindowID, identity.windowID)
+	}
+	if codexProfileIncludesHeader(profile, identity.websocket, profile.Headers.TurnMetadata) {
+		headers.Set(profile.Headers.TurnMetadata, identity.turnMetadataJSON)
+	}
+	if identity.parentThreadID != "" && codexProfileIncludesHeader(profile, identity.websocket, profile.Headers.ParentThreadID) {
 		headers.Set(profile.Headers.ParentThreadID, identity.parentThreadID)
 	}
-	if identity.subagentKind != "" {
+	if identity.subagentKind != "" && codexProfileIncludesHeader(profile, identity.websocket, profile.Headers.Subagent) {
 		headers.Set(profile.Headers.Subagent, identity.subagentKind)
 	}
+}
+
+func codexUserAgentForAuth(profile registry.CodexFingerprintProfile, auth *cliproxyauth.Auth) string {
+	value := ""
+	if auth != nil && auth.Attributes != nil {
+		value = strings.TrimSpace(auth.Attributes["codex_user_agent"])
+	}
+	if value == "" && auth != nil && auth.Metadata != nil {
+		value, _ = auth.Metadata["codex_user_agent"].(string)
+		value = strings.TrimSpace(value)
+	}
+	if strings.HasPrefix(value, profile.Originator+"/") && httpguts.ValidHeaderFieldValue(value) {
+		return value
+	}
+	return profile.UserAgent()
+}
+
+func codexProfileIncludesHeader(profile registry.CodexFingerprintProfile, websocket bool, name string) bool {
+	names := profile.HTTPHeaderNames
+	if websocket {
+		names = profile.WebsocketHeaderNames
+	}
+	for _, candidate := range names {
+		if strings.EqualFold(strings.TrimSpace(candidate), strings.TrimSpace(name)) {
+			return true
+		}
+	}
+	return false
+}
+
+func setCodexDualIdentityHeaders(headers http.Header, kind, value string) {
+	if headers == nil || strings.TrimSpace(value) == "" {
+		return
+	}
+	underscore := strings.ToLower(strings.TrimSpace(kind)) + "_id"
+	hyphen := strings.ToLower(strings.TrimSpace(kind)) + "-id"
+	for key := range headers {
+		if strings.EqualFold(key, underscore) || strings.EqualFold(key, hyphen) {
+			delete(headers, key)
+		}
+	}
+	headers[underscore] = []string{value}
+	headers[hyphen] = []string{value}
 }
 
 func codexApplicationIsWebsocket(requestURL string) bool {
@@ -200,10 +284,33 @@ func codexOfficialFingerprintScope(cfg *config.Config, auth *cliproxyauth.Auth, 
 	if auth == nil || strings.TrimSpace(auth.ID) == "" {
 		return false
 	}
-	if cfg != nil && cfg.Codex.DisableCodexCloaking {
-		return false
-	}
+	_ = cfg
 	return codexOfficialApplicationTarget(auth, requestURL)
+}
+
+func codexFingerprintModeForRequest(cfg *config.Config, auth *cliproxyauth.Auth) codexFingerprintMode {
+	raw := ""
+	if auth != nil && auth.Attributes != nil {
+		raw = strings.TrimSpace(auth.Attributes["codex_fingerprint_mode"])
+	}
+	if raw == "" && auth != nil && auth.Metadata != nil {
+		if value, ok := auth.Metadata["codex_fingerprint_mode"].(string); ok {
+			raw = strings.TrimSpace(value)
+		}
+	}
+	if raw == "" && cfg != nil {
+		raw = strings.TrimSpace(cfg.Codex.FingerprintMode)
+	}
+	switch codexFingerprintMode(strings.ToLower(raw)) {
+	case codexFingerprintDevice:
+		return codexFingerprintDevice
+	case codexFingerprintSession:
+		return codexFingerprintSession
+	case codexFingerprintFull:
+		return codexFingerprintFull
+	default:
+		return codexFingerprintOff
+	}
 }
 
 func codexOfficialApplicationTarget(auth *cliproxyauth.Auth, requestURL string) bool {
@@ -235,34 +342,43 @@ func codexApplicationRequestKind(requestURL string) string {
 
 func stableCodexApplicationUUID(authIdentity, kind, value string) string {
 	value = strings.TrimSpace(value)
-	if parsed, errParse := uuid.Parse(value); errParse == nil {
-		return parsed.String()
-	}
 	name := strings.Join([]string{"cli-proxy-api", "codex", "application-identity", kind, authIdentity, value}, "\x00")
-	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(name)).String()
+	sum := sha256.Sum256([]byte(name))
+	var id uuid.UUID
+	copy(id[:], sum[:16])
+	id[6] = (id[6] & 0x0f) | 0x40
+	id[8] = (id[8] & 0x3f) | 0x80
+	return id.String()
 }
 
-func cachedCodexApplicationWindow(authIdentity, sessionID string) string {
-	key := authIdentity + "\x00" + sessionID
-	now := time.Now()
-	codexApplicationWindows.Lock()
-	defer codexApplicationWindows.Unlock()
-	for existingKey, entry := range codexApplicationWindows.entries {
-		if !entry.expiresAt.After(now) {
-			delete(codexApplicationWindows.entries, existingKey)
+func codexConvergedInstallationID(auth *cliproxyauth.Auth) string {
+	if auth != nil {
+		if auth.Attributes != nil {
+			if value := strings.TrimSpace(auth.Attributes["openai_device_id"]); value != "" {
+				return value
+			}
+		}
+		if auth.Metadata != nil {
+			if value, ok := auth.Metadata["openai_device_id"].(string); ok && strings.TrimSpace(value) != "" {
+				return strings.TrimSpace(value)
+			}
 		}
 	}
-	if entry, ok := codexApplicationWindows.entries[key]; ok && entry.expiresAt.After(now) {
-		entry.expiresAt = now.Add(codexApplicationWindowTTL)
-		codexApplicationWindows.entries[key] = entry
-		return entry.id
+	authIdentity := ""
+	if auth != nil {
+		authIdentity = strings.TrimSpace(auth.ID)
 	}
-	windowID := newCodexUUIDv7()
-	codexApplicationWindows.entries[key] = codexApplicationWindowEntry{
-		id:        windowID,
-		expiresAt: now.Add(codexApplicationWindowTTL),
+	return stableCodexApplicationUUID(authIdentity, "installation", "")
+}
+
+func codexFingerprintClientSessionID(headers http.Header) string {
+	if headers == nil {
+		return ""
 	}
-	return windowID
+	if value := strings.TrimSpace(headers.Get("Session-Id")); value != "" {
+		return value
+	}
+	return strings.TrimSpace(headers.Get("Session_id"))
 }
 
 func newCodexUUIDv7() string {

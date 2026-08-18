@@ -907,13 +907,16 @@ func (m *modelScheduler) availabilitySummaryLocked(predicate func(*scheduledAuth
 	cooldownCount := 0
 	earliest := time.Time{}
 	for _, entry := range m.entries {
+		if entry == nil || entry.auth == nil || entry.state == scheduledStateDisabled {
+			continue
+		}
+		if entry.auth.Disabled || entry.auth.Status == StatusDisabled {
+			continue
+		}
 		if predicate != nil && !predicate(entry) {
 			continue
 		}
 		total++
-		if entry == nil || entry.auth == nil {
-			continue
-		}
 		if entry.state != scheduledStateCooldown {
 			continue
 		}

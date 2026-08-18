@@ -44,6 +44,10 @@ func parseCodexWebsocketError(payload []byte) (error, bool) {
 	out := buildCodexWebsocketErrorPayload(payload, status)
 	headers := parseCodexWebsocketErrorHeaders(payload)
 	statusError := statusErr{code: status, msg: string(out)}
+	statusError.providerCode = strings.TrimSpace(gjson.GetBytes(out, "error.type").String())
+	if statusError.providerCode == "" {
+		statusError.providerCode = strings.TrimSpace(gjson.GetBytes(out, "error.code").String())
+	}
 	if retryAfter := parseCodexRetryAfter(status, out, time.Now()); retryAfter != nil {
 		statusError.retryAfter = retryAfter
 	} else if isCodexWebsocketConnectionLimitError(payload) {

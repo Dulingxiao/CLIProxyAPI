@@ -5,7 +5,7 @@
 ## 安装与导入
 
 ```bash
-go get github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy
+go get github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy
 ```
 
 ```go
@@ -14,12 +14,12 @@ import (
     "errors"
     "time"
 
-    "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-    "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy"
+    "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy"
+    "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
 ```
 
-注意模块路径包含 `/v6`。
+注意模块路径包含 `/v7`。
 
 ## 最小可用示例
 
@@ -75,6 +75,35 @@ svc, _ := cliproxy.NewBuilder().
 - 仅当 `config.yaml` 中设置了 `remote-management.secret-key` 时才会挂载管理端点。
 - 远程访问还需要 `remote-management.allow-remote: true`。
 - 具体端点见 MANAGEMENT_API_CN.md。内嵌服务器会在配置端口下暴露 `/v0/management`。
+
+## Codex 额度、超刷与计费
+
+这些服务使用传给 Builder 的同一个 `config.Config`。从文件加载时会自动补齐默认值；直接构造配置时，建议从导出的默认配置函数开始：
+
+```go
+quota := config.DefaultCodexQuotaConfig()
+
+overdraft := config.DefaultCodexOverdraftConfig()
+overdraft.Enabled = true
+overdraft.ProbeModel = "gpt-5.3-codex"
+
+ledger := config.DefaultAccountingConfig()
+ledger.Enabled = true
+
+cfg.Codex.Quota = quota
+cfg.Codex.Overdraft = overdraft
+cfg.Accounting = ledger
+```
+
+开启超刷需要同时开启额度采集和 Accounting，并配置探测模型。依赖关闭时，Manager 会先关闭超刷准入，再排空 Accounting、停止额度调度。取消 `Service.Run` 时也会先排空内建 Usage 队列，再关闭计费存储。
+
+被动额度观察通过有界、按 Auth 保序的后台路径处理；业务请求不等待主动额度查询或价格计算。Codex 实际发送前会同步持久化 Attempt Intent，终态 Usage Part 也会在 Usage 投递返回前同步持久化；只有定价任务异步执行。Accounting 默认存储在 `AUTH_STATE_DIR/accounting.db`，超刷协调状态与额度历史分别使用配套的 `<base>-overdraft.db` 和 `<base>-quota.db`。
+
+Accounting 写入故障会阻断准入，并保持为粘性故障，直到服务重启并完成 reconcile；请求完成后的持久化错误属于请求级错误，不会换凭据重放已经完成的上游工作。额度库存储故障只关闭超刷 Overlay，通过 `CodexQuotaRuntimeHealth()` 和 `GET /v0/management/codex/quota/health` 暴露，普通调度继续可用。Event/Cost 管理分页支持 Auth.ID、provider、model、tier、drain cycle、RFC3339 `[from,to)` 时间范围和有界分页筛选。
+
+`codex.fingerprint-mode` 默认是 `off`。`device`、`session`、`full` 会逐级收敛官方 Codex 应用身份，Auth 属性 `codex_fingerprint_mode` 与 `openai_device_id` 可覆盖全局设置。Turn State 来源保护与此独立：换号时会剥离已知跨 Auth 的 `X-Codex-Turn-State`，并且即使关闭通用响应头透传，也会把最终上游状态转发给下游。
+
+内嵌运维集成可使用核心 Manager 的 `CodexOverdraftCoordinator()`、`CodexQuotaSnapshot(s)`、`CodexQuotaRuntimeHealth()`、`RefreshCodexQuota` 和 `AccountingService()`。运行态记录和管理筛选统一使用 `Auth.ID`。
 
 ## 使用核心鉴权管理器
 
@@ -161,4 +190,3 @@ _ = svc.Shutdown(ctx)
 - 热更新：`config.yaml` 与 `auths/` 变化会被自动侦测并应用。
 - 请求日志可通过管理 API 在运行时开关。
 - `gemini-web.*` 相关配置在内嵌服务器中会被遵循。
-

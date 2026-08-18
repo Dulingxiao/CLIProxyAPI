@@ -40,6 +40,15 @@ func TestCodexFingerprintUpdaterBuildsCompleteProfile(t *testing.T) {
 	if profile.Headers.SessionID != "session-id" || profile.Headers.ThreadID != "thread-id" {
 		t.Fatalf("session/thread headers = %q/%q", profile.Headers.SessionID, profile.Headers.ThreadID)
 	}
+	if strings.Join(profile.HTTPHeaderNames, ",") != "x-codex-turn-metadata,x-openai-internal-codex-residency,x-openai-subagent" {
+		t.Fatalf("HTTP header names = %#v", profile.HTTPHeaderNames)
+	}
+	if strings.Join(profile.WebsocketHeaderNames, ",") != "openai-beta,x-client-request-id,x-codex-turn-state" {
+		t.Fatalf("websocket header names = %#v", profile.WebsocketHeaderNames)
+	}
+	if profile.HeaderPolicy != "omit_uncertain" {
+		t.Fatalf("header policy = %q", profile.HeaderPolicy)
+	}
 	if profile.MetadataKeys.TurnStartedAtUnixMS != "turn_started_at_unix_ms" {
 		t.Fatalf("turn start metadata key = %q", profile.MetadataKeys.TurnStartedAtUnixMS)
 	}
@@ -172,12 +181,24 @@ pub fn get_codex_user_agent() -> String {
 pub const X_CODEX_INSTALLATION_ID_HEADER: &str = "x-codex-installation-id";
 pub const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 pub const X_CODEX_TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
+pub const RESIDENCY_HEADER_NAME: &str = "x-openai-internal-codex-residency";
 pub const X_CODEX_PARENT_THREAD_ID_HEADER: &str = "x-codex-parent-thread-id";
 pub const X_CODEX_WINDOW_ID_HEADER: &str = "x-codex-window-id";
 pub const X_OPENAI_SUBAGENT_HEADER: &str = "x-openai-subagent";
 pub const X_RESPONSESAPI_INCLUDE_TIMING_METRICS_HEADER: &str = "x-responsesapi-include-timing-metrics";
 const RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-03-01";
-headers.insert("x-client-request-id", header_value);`)
+fn build_responses_headers() {
+    headers.insert(X_CODEX_TURN_METADATA_HEADER, metadata);
+    headers.insert(RESIDENCY_HEADER_NAME, residency);
+}
+fn build_subagent_headers() {
+    headers.insert(X_OPENAI_SUBAGENT_HEADER, subagent);
+}
+fn build_websocket_headers() {
+    headers.insert("openai-beta", beta);
+    headers.insert("x-client-request-id", request_id);
+    headers.insert(X_CODEX_TURN_STATE_HEADER, state);
+}`)
 		case "/responses-metadata":
 			fmt.Fprint(w, `
 pub(crate) const INSTALLATION_ID_KEY: &str = "installation_id";

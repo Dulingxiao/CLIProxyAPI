@@ -27,6 +27,7 @@ static/*
 auths/*
 /auths
 !auths/.gitkeep
+sdk/cliproxy/auths/
 
 # Documentation
 docs/*

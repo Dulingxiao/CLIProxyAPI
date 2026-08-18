@@ -25,6 +25,9 @@ type Config struct {
 	// CredentialInFlight configures credential observation snapshots.
 	CredentialInFlight CredentialInFlightConfig `yaml:"credential-in-flight" json:"credential-in-flight"`
 
+	// Accounting configures durable per-auth usage accounting.
+	Accounting AccountingConfig `yaml:"accounting,omitempty" json:"accounting"`
+
 	// RemoteManagement nests management-related options under 'remote-management'.
 	RemoteManagement RemoteManagement `yaml:"remote-management" json:"-"`
 

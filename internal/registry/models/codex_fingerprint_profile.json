@@ -5,7 +5,12 @@
   "originator": "codex_cli_rs",
   "user_agent_template": "{originator}/{version} (Mac OS 26.5.2; arm64) Apple_Terminal/470 (codex-tui; {version})",
   "websocket_beta": "responses_websockets=2026-02-06",
+  "http_header_names": ["session-id", "thread-id", "x-codex-turn-metadata", "x-oai-attestation", "x-openai-internal-codex-residency", "x-openai-subagent"],
+  "websocket_header_names": ["openai-beta", "session-id", "thread-id", "x-client-request-id", "x-codex-turn-state", "x-oai-attestation", "x-openai-internal-codex-residency"],
+  "header_policy": "omit_uncertain",
   "headers": {
+    "attestation": "x-oai-attestation",
+    "residency": "x-openai-internal-codex-residency",
     "installation_id": "x-codex-installation-id",
     "turn_state": "x-codex-turn-state",
     "turn_metadata": "x-codex-turn-metadata",

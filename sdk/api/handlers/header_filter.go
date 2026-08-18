@@ -46,6 +46,10 @@ var cpaReservedResponseHeaders = map[string]struct{}{
 	"X-Cpa-Trace-Id":                   {},
 }
 
+var protocolResponseHeaders = map[string]struct{}{
+	"X-Codex-Turn-State": {},
+}
+
 // IsCPAReservedResponseHeader reports whether a downstream response header is managed by CPA.
 func IsCPAReservedResponseHeader(name string) bool {
 	_, reserved := cpaReservedResponseHeaders[http.CanonicalHeaderKey(name)]
@@ -85,6 +89,24 @@ func FilterUpstreamHeaders(src http.Header) http.Header {
 			continue
 		}
 		dst[key] = values
+	}
+	if len(dst) == 0 {
+		return nil
+	}
+	return dst
+}
+
+// ProtocolResponseHeaders returns upstream protocol state that clients must receive
+// even when general response-header passthrough is disabled.
+func ProtocolResponseHeaders(src http.Header) http.Header {
+	if src == nil {
+		return nil
+	}
+	dst := make(http.Header)
+	for key := range protocolResponseHeaders {
+		if values := src.Values(key); len(values) > 0 {
+			dst[http.CanonicalHeaderKey(key)] = append([]string(nil), values...)
+		}
 	}
 	if len(dst) == 0 {
 		return nil

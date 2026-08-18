@@ -57,3 +57,39 @@ func TestFilterUpstreamHeaders_ReturnsNilWhenAllHeadersBlocked(t *testing.T) {
 		t.Fatalf("expected nil when all headers are filtered, got %#v", filtered)
 	}
 }
+
+func TestDownstreamHeadersAlwaysRelaysCodexTurnState(t *testing.T) {
+	src := http.Header{}
+	src.Set("X-Codex-Turn-State", "turn-state")
+	src.Set("X-Request-Id", "request-id")
+
+	filtered := downstreamHeadersFromExecutor(src, false)
+	if got := filtered.Get("X-Codex-Turn-State"); got != "turn-state" {
+		t.Fatalf("X-Codex-Turn-State = %q, want turn-state", got)
+	}
+	if got := filtered.Get("X-Request-Id"); got != "" {
+		t.Fatalf("X-Request-Id = %q, want empty without passthrough", got)
+	}
+}
+
+func TestDownstreamHeadersAfterNoopInterceptorKeepsCodexTurnState(t *testing.T) {
+	base := http.Header{}
+	base.Set("X-Codex-Turn-State", "turn-state")
+	base.Set("X-Request-Id", "request-id")
+
+	filtered := downstreamHeadersAfterInterceptors(base, base.Clone(), false)
+	if got := filtered.Get("X-Codex-Turn-State"); got != "turn-state" {
+		t.Fatalf("X-Codex-Turn-State = %q, want turn-state", got)
+	}
+	if got := filtered.Get("X-Request-Id"); got != "" {
+		t.Fatalf("X-Request-Id = %q, want empty without passthrough", got)
+	}
+}
+
+func TestDownstreamHeadersAfterInterceptorCanRemoveCodexTurnState(t *testing.T) {
+	base := http.Header{"X-Codex-Turn-State": []string{"turn-state"}}
+	filtered := downstreamHeadersAfterInterceptors(base, http.Header{}, false)
+	if got := filtered.Get("X-Codex-Turn-State"); got != "" {
+		t.Fatalf("X-Codex-Turn-State = %q, want interceptor removal", got)
+	}
+}

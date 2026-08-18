@@ -7,7 +7,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/codexoverdraft"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	usageaccounting "github.com/router-for-me/CLIProxyAPI/v7/internal/usage/accounting"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
@@ -156,6 +158,47 @@ type Manager struct {
 	// refreshLocks serializes credential refresh per auth ID so concurrent
 	// 401 recoveries and auto-refresh workers do not race the same refresh_token.
 	refreshLocks sync.Map
+
+	// codexOverdraftMu protects coordinator lifecycle and auth generations.
+	codexOverdraftMu          sync.RWMutex
+	codexOverdraft            *codexoverdraft.Coordinator
+	codexOverdraftStore       *codexoverdraft.BoltStore
+	codexOverdraftRevision    uint64
+	codexOverdraftGenerations map[string]uint64
+	codexLegacyInFlight       map[string]int
+
+	codexQuotaEnabled       atomic.Bool
+	codexQuotaHealthy       atomic.Bool
+	codexQuotaSequence      atomic.Uint64
+	codexQuotaHealthMu      sync.RWMutex
+	codexQuotaLastError     string
+	codexQuotaMu            sync.RWMutex
+	codexQuotaState         *codexoverdraft.QuotaState
+	codexQuotaSnapshots     map[string]codexoverdraft.QuotaSnapshot
+	codexQuotaPrevSnapshots map[string]codexoverdraft.QuotaSnapshot
+	codexQuotaDebug         map[string]CodexQuotaDebugSnapshot
+	codexQuotaStoreMu       sync.Mutex
+	codexQuotaStore         *codexoverdraft.QuotaStore
+	codexQuotaStorePath     string
+
+	codexQuotaRuntimeMu sync.RWMutex
+	codexQuotaRuntime   *codexQuotaRuntime
+
+	codexProbeMu   sync.Mutex
+	codexProbeRuns map[string]*codexProbeRun
+
+	accountingMu       sync.RWMutex
+	accountingService  *usageaccounting.Service
+	accountingStore    *usageaccounting.BoltStore
+	accountingPath     string
+	accountingRequired atomic.Bool
+
+	codexTurnStateOrigins sync.Map
+	codexTurnStateWrites  atomic.Uint64
+
+	// upstreamFailures is protected by mu and stores only bounded, sanitized
+	// failure metadata. Request bodies, prompts, and credentials never enter it.
+	upstreamFailures map[string]*authUpstreamFailureHistory
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
@@ -167,16 +210,24 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		hook = NoopHook{}
 	}
 	manager := &Manager{
-		store:                 store,
-		executors:             make(map[string]ProviderExecutor),
-		selector:              selector,
-		hook:                  hook,
-		auths:                 make(map[string]*Auth),
-		homeRuntimeAuths:      make(map[string]map[string]*Auth),
-		homeRuntimeAuthOwners: make(map[string]map[string]*HomeDispatchSelection),
-		homeSessionSelections: make(map[string]map[homeSessionSelectionKey]*HomeDispatchSelection),
-		providerOffsets:       make(map[string]int),
-		modelPoolOffsets:      make(map[string]int),
+		store:                     store,
+		executors:                 make(map[string]ProviderExecutor),
+		selector:                  selector,
+		hook:                      hook,
+		auths:                     make(map[string]*Auth),
+		homeRuntimeAuths:          make(map[string]map[string]*Auth),
+		homeRuntimeAuthOwners:     make(map[string]map[string]*HomeDispatchSelection),
+		homeSessionSelections:     make(map[string]map[homeSessionSelectionKey]*HomeDispatchSelection),
+		providerOffsets:           make(map[string]int),
+		modelPoolOffsets:          make(map[string]int),
+		codexOverdraftGenerations: make(map[string]uint64),
+		codexLegacyInFlight:       make(map[string]int),
+		codexQuotaState:           codexoverdraft.NewQuotaState(),
+		codexQuotaSnapshots:       make(map[string]codexoverdraft.QuotaSnapshot),
+		codexQuotaPrevSnapshots:   make(map[string]codexoverdraft.QuotaSnapshot),
+		codexQuotaDebug:           make(map[string]CodexQuotaDebugSnapshot),
+		codexProbeRuns:            make(map[string]*codexProbeRun),
+		upstreamFailures:          make(map[string]*authUpstreamFailureHistory),
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})

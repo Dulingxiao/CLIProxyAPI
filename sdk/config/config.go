@@ -12,6 +12,9 @@ type Config = internalconfig.Config
 
 type StreamingConfig = internalconfig.StreamingConfig
 type ClaudeCodeConfig = internalconfig.ClaudeCodeConfig
+type CodexQuotaConfig = internalconfig.CodexQuotaConfig
+type CodexOverdraftConfig = internalconfig.CodexOverdraftConfig
+type AccountingConfig = internalconfig.AccountingConfig
 type TLSConfig = internalconfig.TLSConfig
 type RemoteManagement = internalconfig.RemoteManagement
 type OAuthModelAlias = internalconfig.OAuthModelAlias
@@ -35,6 +38,10 @@ type TLS = internalconfig.TLSConfig
 
 const (
 	DefaultPanelGitHubRepository = internalconfig.DefaultPanelGitHubRepository
+	DefaultCodexTLSProfile       = internalconfig.DefaultCodexTLSProfile
+	CodexTLSProfileChrome        = internalconfig.CodexTLSProfileChrome
+	CodexTLSProfileSafariLike    = internalconfig.CodexTLSProfileSafariLike
+	CodexTLSProfileGoStandard    = internalconfig.CodexTLSProfileGoStandard
 )
 
 func LoadConfig(configFile string) (*Config, error) { return internalconfig.LoadConfig(configFile) }
@@ -44,6 +51,14 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 }
 
 func ParseConfigBytes(data []byte) (*Config, error) { return internalconfig.ParseConfigBytes(data) }
+
+func DefaultCodexQuotaConfig() CodexQuotaConfig { return internalconfig.DefaultCodexQuotaConfig() }
+
+func DefaultCodexOverdraftConfig() CodexOverdraftConfig {
+	return internalconfig.DefaultCodexOverdraftConfig()
+}
+
+func DefaultAccountingConfig() AccountingConfig { return internalconfig.DefaultAccountingConfig() }
 
 func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	return internalconfig.SaveConfigPreserveComments(configFile, cfg)

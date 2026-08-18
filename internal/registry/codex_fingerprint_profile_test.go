@@ -80,15 +80,28 @@ func TestCodexFingerprintProfileStoreRejectsDowngrade(t *testing.T) {
 	}
 }
 
+func TestCodexFingerprintProfileRejectsVersionBelowGateFloor(t *testing.T) {
+	profile := validTestCodexFingerprintProfile()
+	profile.Version = "0.145.0"
+	if err := validateCodexFingerprintProfile(profile); err == nil || !strings.Contains(err.Error(), "below minimum") {
+		t.Fatalf("validateCodexFingerprintProfile() error = %v, want minimum version error", err)
+	}
+}
+
 func validTestCodexFingerprintProfile() CodexFingerprintProfile {
 	return CodexFingerprintProfile{
-		SchemaVersion:     1,
-		SourceRevision:    "test-revision",
-		Version:           "0.146.0",
-		Originator:        "codex_cli_rs",
-		UserAgentTemplate: "{originator}/{version} (Mac OS 26.5.2; arm64) Apple_Terminal/470 (codex-tui; {version})",
-		WebsocketBeta:     "responses_websockets=2026-02-06",
+		SchemaVersion:        1,
+		SourceRevision:       "test-revision",
+		Version:              "0.146.0",
+		Originator:           "codex_cli_rs",
+		UserAgentTemplate:    "{originator}/{version} (Mac OS 26.5.2; arm64) Apple_Terminal/470 (codex-tui; {version})",
+		WebsocketBeta:        "responses_websockets=2026-02-06",
+		HTTPHeaderNames:      []string{"x-codex-turn-metadata", "x-openai-subagent"},
+		WebsocketHeaderNames: []string{"openai-beta", "x-client-request-id", "x-codex-turn-state"},
+		HeaderPolicy:         "omit_uncertain",
 		Headers: CodexFingerprintHeaders{
+			Attestation:     "x-oai-attestation",
+			Residency:       "x-openai-internal-codex-residency",
 			InstallationID:  "x-codex-installation-id",
 			TurnState:       "x-codex-turn-state",
 			TurnMetadata:    "x-codex-turn-metadata",

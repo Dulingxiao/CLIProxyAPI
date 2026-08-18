@@ -77,7 +77,7 @@ For scoped official OAuth traffic, the active profile supplies `User-Agent`, `Or
 
 ### TLS parity
 
-Keep the existing Chrome uTLS HTTP/2 path for `chatgpt.com`. Extend the official `wss://chatgpt.com` path to perform a Chrome uTLS handshake with HTTP/1.1 ALPN before the Gorilla WebSocket upgrade. The dial path uses the existing proxy abstraction so direct, HTTP, HTTPS, SOCKS5, and SOCKS5H egress continue to work. Custom WebSocket gateways retain the standard TLS path.
+The transport profile is an explicit A/B choice: `chrome` (current behavior), `safari-like`, or `go-standard` (control and operational fallback). `codex-native` is outside the critical path: byte-for-byte reproduction of a particular Rustls build conflicts with this profile's public-contract boundary and can perform worse at some edge networks. The 2026-08-17 HTTP/2 spike selected **(c) known difference/no fork**: Go's public transport API does not provide stable control of every SETTINGS value or on-wire header order, so those properties are observed in A-B telemetry rather than maintained through a private fork. The official `wss://chatgpt.com` path uses the matching profile with HTTP/1.1 ALPN before the Gorilla WebSocket upgrade. Custom WebSocket gateways retain the standard TLS path. HTTP connection pools and TLS session caches are keyed by `(Auth.ID, proxy, profile)` and never cross those boundaries; disabling `tls-reuse-connections` disables keep-alive and session reuse.
 
 ## Data Flow
 
@@ -107,4 +107,4 @@ Keep the existing Chrome uTLS HTTP/2 path for `chatgpt.com`. Extend the official
 
 ## Boundaries
 
-This feature synchronizes the public application request contract. It preserves a real inbound attestation header but does not synthesize an OpenAI attestation token. TLS uses the project's established Chrome uTLS profile; reproducing a specific Rustls binary build byte-for-byte is outside this profile contract.
+This feature synchronizes the public application request contract. It preserves a real inbound attestation header but does not synthesize an OpenAI attestation token. TLS profiles are limited to the constructible `chrome`, `safari-like`, and `go-standard` A/B set; reproducing a specific Rustls binary build byte-for-byte and a `codex-native` profile are outside this contract. Profile selection is evaluated by controlled 403, challenge, disconnect, and JA3/JA4 observations instead of assumed from User-Agent similarity.

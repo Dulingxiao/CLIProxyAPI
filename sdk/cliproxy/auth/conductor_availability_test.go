@@ -2,11 +2,51 @@ package auth
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 )
+
+func TestIsAuthBlockedForModelKeepsCooldownClassificationAcrossStates(t *testing.T) {
+	now := time.Now()
+	auth := &Auth{ID: "mixed", ModelStates: map[string]*ModelState{
+		"gpt-5.5": {
+			Unavailable:    true,
+			NextRetryAfter: now.Add(time.Minute),
+			Quota:          QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: now.Add(time.Minute)},
+			LastError:      &Error{Code: "usage_limit_reached", HTTPStatus: 429},
+		},
+		"gpt-5.5(high)": {
+			Unavailable:    true,
+			NextRetryAfter: now.Add(5 * time.Minute),
+			LastError:      &Error{Code: "server_error", HTTPStatus: 500},
+		},
+	}}
+	blocked, reason, next := isAuthBlockedForModel(auth, "gpt-5.5", now)
+	if !blocked || reason != blockReasonCooldown || next.Before(now.Add(4*time.Minute)) {
+		t.Fatalf("blocked = %t reason = %v next = %v", blocked, reason, next)
+	}
+}
+
+func TestAvailableAuthsReportsReasonsAndRetryForTemporaryFailures(t *testing.T) {
+	now := time.Now()
+	manager := NewManager(nil, nil, nil)
+	auths := []*Auth{
+		{ID: "server", Provider: "codex", ModelStates: map[string]*ModelState{"gpt-5.5": {Unavailable: true, NextRetryAfter: now.Add(2 * time.Minute), LastError: &Error{Code: "server_error", HTTPStatus: 500}}}},
+		{ID: "unauthorized", Provider: "codex", ModelStates: map[string]*ModelState{"gpt-5.5": {Unavailable: true, NextRetryAfter: now.Add(3 * time.Minute), LastError: &Error{Code: "unauthorized", HTTPStatus: 401}}}},
+	}
+	_, errAvailable := manager.availableAuthsForRouteModel(auths, "codex", "gpt-5.5", now)
+	var authErr *Error
+	if !errors.As(errAvailable, &authErr) || authErr.Code != "auth_unavailable" {
+		t.Fatalf("error = %T %v", errAvailable, errAvailable)
+	}
+	if !authErr.Retryable || authErr.HTTPStatus != 503 || !strings.Contains(authErr.Message, "reason=server_error,unauthorized") || !strings.Contains(authErr.Message, "retry_after=") {
+		t.Fatalf("auth error = %#v", authErr)
+	}
+}
 
 func TestUpdateAggregatedAvailability_UnavailableWithoutNextRetryDoesNotBlockAuth(t *testing.T) {
 	t.Parallel()

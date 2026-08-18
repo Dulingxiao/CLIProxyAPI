@@ -1,0 +1,25 @@
+{
+  "source_revision": "ba42e6866cef4baed7ad92c73e6be8cd42e49d8b",
+  "http": [
+    "originator",
+    "session-id",
+    "session_id",
+    "thread-id",
+    "thread_id",
+    "user-agent",
+    "version",
+    "x-codex-turn-metadata",
+    "x-openai-subagent"
+  ],
+  "websocket": [
+    "openai-beta",
+    "originator",
+    "session-id",
+    "session_id",
+    "thread-id",
+    "thread_id",
+    "user-agent",
+    "version",
+    "x-client-request-id"
+  ]
+}

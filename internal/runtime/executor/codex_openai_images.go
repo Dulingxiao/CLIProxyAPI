@@ -92,6 +92,10 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 	}
 
 	apiKey, baseURL := codexCreds(auth)
+	authID := ""
+	if auth != nil {
+		authID = auth.ID
+	}
 	if baseURL == "" {
 		baseURL = "https://chatgpt.com/backend-api/codex"
 	}
@@ -119,6 +123,9 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
+	if errBegin := helps.BeginCodexOverdraftSend(opts); errBegin != nil {
+		return resp, errBegin
+	}
 	httpResp, errDo := httpClient.Do(httpReq)
 	if errDo != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
@@ -131,6 +138,7 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 	}()
 
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	helps.PublishCodexQuotaHeaders(opts, authID, httpResp.Header)
 	data, errRead := io.ReadAll(httpResp.Body)
 	if errRead != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errRead)
@@ -156,9 +164,16 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 			collectCodexOutputItemDone(eventData, outputItemsByIndex, &outputItemsFallback)
 		case "response.completed":
 			if detail, ok := helps.ParseCodexUsage(eventData); ok {
-				reporter.Publish(ctx, detail)
+				if errUsage := reporter.Publish(ctx, detail); errUsage != nil {
+					return resp, cliproxyexecutor.NewUsagePersistenceError(errUsage)
+				}
 			}
-			publishCodexImageToolUsage(ctx, reporter, body, eventData)
+			if errUsage := publishCodexImageToolUsage(ctx, reporter, body, eventData); errUsage != nil {
+				return resp, cliproxyexecutor.NewUsagePersistenceError(errUsage)
+			}
+			if errUsage := reporter.EnsurePublished(ctx); errUsage != nil {
+				return resp, cliproxyexecutor.NewUsagePersistenceError(errUsage)
+			}
 			results, createdAt, usageRaw, firstMeta, errExtract := codexExtractImageResults(eventData, outputItemsByIndex, outputItemsFallback)
 			if errExtract != nil {
 				return resp, errExtract
@@ -189,6 +204,10 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 	}
 
 	apiKey, baseURL := codexCreds(auth)
+	authID := ""
+	if auth != nil {
+		authID = auth.ID
+	}
 	if baseURL == "" {
 		baseURL = "https://chatgpt.com/backend-api/codex"
 	}
@@ -216,12 +235,16 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
+	if errBegin := helps.BeginCodexOverdraftSend(opts); errBegin != nil {
+		return nil, errBegin
+	}
 	httpResp, errDo := httpClient.Do(httpReq)
 	if errDo != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
 		return nil, errDo
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	helps.PublishCodexQuotaHeaders(opts, authID, httpResp.Header)
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		data, errRead := io.ReadAll(httpResp.Body)
 		if errClose := httpResp.Body.Close(); errClose != nil {
@@ -285,9 +308,19 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 				}
 			case "response.completed":
 				if detail, ok := helps.ParseCodexUsage(eventData); ok {
-					reporter.Publish(ctx, detail)
+					if errUsage := reporter.Publish(ctx, detail); errUsage != nil {
+						sendError(cliproxyexecutor.NewUsagePersistenceError(errUsage))
+						return
+					}
 				}
-				publishCodexImageToolUsage(ctx, reporter, body, eventData)
+				if errUsage := publishCodexImageToolUsage(ctx, reporter, body, eventData); errUsage != nil {
+					sendError(cliproxyexecutor.NewUsagePersistenceError(errUsage))
+					return
+				}
+				if errUsage := reporter.EnsurePublished(ctx); errUsage != nil {
+					sendError(cliproxyexecutor.NewUsagePersistenceError(errUsage))
+					return
+				}
 				results, _, usageRaw, _, errExtract := codexExtractImageResults(eventData, outputItemsByIndex, outputItemsFallback)
 				if errExtract != nil {
 					sendError(errExtract)
@@ -322,6 +355,10 @@ func (e *CodexExecutor) executeDirectOpenAIImage(ctx context.Context, auth *clip
 	}
 
 	apiKey, baseURL := codexCreds(auth)
+	authID := ""
+	if auth != nil {
+		authID = auth.ID
+	}
 	if baseURL == "" {
 		baseURL = "https://chatgpt.com/backend-api/codex"
 	}
@@ -346,6 +383,9 @@ func (e *CodexExecutor) executeDirectOpenAIImage(ctx context.Context, auth *clip
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
+	if errBegin := helps.BeginCodexOverdraftSend(opts); errBegin != nil {
+		return resp, errBegin
+	}
 	httpResp, errDo := httpClient.Do(httpReq)
 	if errDo != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
@@ -358,6 +398,7 @@ func (e *CodexExecutor) executeDirectOpenAIImage(ctx context.Context, auth *clip
 	}()
 
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	helps.PublishCodexQuotaHeaders(opts, authID, httpResp.Header)
 	data, errRead := io.ReadAll(httpResp.Body)
 	if errRead != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errRead)
@@ -371,8 +412,12 @@ func (e *CodexExecutor) executeDirectOpenAIImage(ctx context.Context, auth *clip
 		return resp, err
 	}
 
-	reporter.Publish(ctx, helps.ParseOpenAIUsage(data))
-	reporter.EnsurePublished(ctx)
+	if errUsage := reporter.Publish(ctx, helps.ParseOpenAIUsage(data)); errUsage != nil {
+		return resp, cliproxyexecutor.NewUsagePersistenceError(errUsage)
+	}
+	if errUsage := reporter.EnsurePublished(ctx); errUsage != nil {
+		return resp, cliproxyexecutor.NewUsagePersistenceError(errUsage)
+	}
 	return cliproxyexecutor.Response{Payload: data, Headers: httpResp.Header.Clone()}, nil
 }
 
@@ -383,6 +428,10 @@ func (e *CodexExecutor) executeDirectOpenAIImageStream(ctx context.Context, auth
 	}
 
 	apiKey, baseURL := codexCreds(auth)
+	authID := ""
+	if auth != nil {
+		authID = auth.ID
+	}
 	if baseURL == "" {
 		baseURL = "https://chatgpt.com/backend-api/codex"
 	}
@@ -407,12 +456,16 @@ func (e *CodexExecutor) executeDirectOpenAIImageStream(ctx context.Context, auth
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
+	if errBegin := helps.BeginCodexOverdraftSend(opts); errBegin != nil {
+		return nil, errBegin
+	}
 	httpResp, errDo := httpClient.Do(httpReq)
 	if errDo != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
 		return nil, errDo
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	helps.PublishCodexQuotaHeaders(opts, authID, httpResp.Header)
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		data, errRead := io.ReadAll(httpResp.Body)
 		if errClose := httpResp.Body.Close(); errClose != nil {
@@ -437,8 +490,19 @@ func (e *CodexExecutor) executeDirectOpenAIImageStream(ctx context.Context, auth
 			if errClose := httpResp.Body.Close(); errClose != nil {
 				log.Errorf("codex executor: close response body error: %v", errClose)
 			}
-			streamUsage.Publish(ctx, reporter)
-			reporter.EnsurePublished(ctx)
+			if _, errUsage := streamUsage.PublishDurable(ctx, reporter); errUsage != nil {
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: cliproxyexecutor.NewUsagePersistenceError(errUsage)}:
+				case <-ctx.Done():
+				}
+				return
+			}
+			if errUsage := reporter.EnsurePublished(ctx); errUsage != nil {
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: cliproxyexecutor.NewUsagePersistenceError(errUsage)}:
+				case <-ctx.Done():
+				}
+			}
 		}()
 
 		buffer := make([]byte, 32*1024)

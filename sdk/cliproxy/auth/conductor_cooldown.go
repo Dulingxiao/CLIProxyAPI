@@ -134,7 +134,37 @@ func (m *Manager) setConfigSnapshotLocked(cfg *internalconfig.Config) bool {
 		m.homeSessionAliases.clear()
 	}
 	m.runtimeConfig.Store(cfg)
-	clearedCooldowns := m.clearDisabledCooldownStates(cfg)
+	overdraftDependenciesRequested := cfg.Codex.Overdraft.Enabled && cfg.Codex.Quota.Enabled && cfg.Accounting.Enabled
+	disabledOverdraftConfig := func() *internalconfig.Config {
+		disabled := cfg.CloneForRuntime()
+		disabled.Codex.Overdraft.Enabled = false
+		return disabled
+	}
+	closeOverdraftFirst := !overdraftDependenciesRequested
+	if closeOverdraftFirst {
+		if errOverdraft := m.applyCodexOverdraftConfig(disabledOverdraftConfig()); errOverdraft != nil {
+			logEntryWithRequestID(nil).Warnf("failed to apply Codex overdraft config: %v", errOverdraft)
+		}
+	}
+	errAccounting := m.applyAccountingConfig(cfg)
+	if errAccounting != nil {
+		logEntryWithRequestID(nil).Warnf("failed to apply accounting config: %v", errAccounting)
+	}
+	errQuota := m.applyCodexQuotaRuntime(cfg)
+	if errQuota != nil {
+		logEntryWithRequestID(nil).Warnf("failed to apply Codex quota config: %v", errQuota)
+	}
+	if overdraftDependenciesRequested && errAccounting == nil && errQuota == nil {
+		if errOverdraft := m.applyCodexOverdraftConfig(cfg); errOverdraft != nil {
+			logEntryWithRequestID(nil).Warnf("failed to apply Codex overdraft config: %v", errOverdraft)
+		}
+	} else if !closeOverdraftFirst {
+		if errOverdraft := m.applyCodexOverdraftConfig(disabledOverdraftConfig()); errOverdraft != nil {
+			logEntryWithRequestID(nil).Warnf("failed to close Codex overdraft after dependency startup failure: %v", errOverdraft)
+		}
+	}
+	creditProtectionChanged := m.reevaluateCodexCreditProtection()
+	clearedCooldowns := m.clearDisabledCooldownStates(cfg) || creditProtectionChanged
 	if clearedCooldowns && oldCooldownStore != nil {
 		m.mu.Lock()
 		if m.cooldownStore == oldCooldownStore {
@@ -721,6 +751,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			auth.Success++
 		} else {
 			auth.Failed++
+			m.recordUpstreamFailureLocked(result, modelKey, now)
 		}
 
 		if result.Success {
@@ -865,6 +896,12 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	m.mu.Unlock()
 	if m.scheduler != nil && authSnapshot != nil {
 		m.scheduler.upsertAuth(authSnapshot)
+	}
+	if authSnapshot != nil && isCodexOverdraftEligibleAuth(authSnapshot) {
+		coordinator := m.CodexOverdraftCoordinator()
+		if hasUnauthorizedAuthFailure(authSnapshot) || coordinator != nil && coordinator.Record(authSnapshot.ID).Disabled {
+			m.syncCodexOverdraftAuth(authSnapshot)
+		}
 	}
 	if authSnapshot != nil && cooldownStateChanged {
 		m.persistCooldownStates(context.Background())
@@ -1232,6 +1269,15 @@ func resultErrorFromError(err error) *Error {
 	}
 	if resultErr.HTTPStatus == 0 {
 		resultErr.HTTPStatus = statusCodeFromError(err)
+	}
+	if resultErr.Code == "" {
+		type providerErrorCoder interface {
+			ProviderErrorCode() string
+		}
+		var providerCode providerErrorCoder
+		if errors.As(err, &providerCode) && providerCode != nil {
+			resultErr.Code = strings.TrimSpace(providerCode.ProviderErrorCode())
+		}
 	}
 	switch {
 	case isRequestScopedError(err) || isRequestInvalidError(err):

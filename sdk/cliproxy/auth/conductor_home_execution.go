@@ -133,11 +133,15 @@ func (m *Manager) executeHome(ctx context.Context, providers []string, req clipr
 			if countTokens {
 				executorCtx = withAccessTokenFingerprintObserver(execCtx, setEffectiveAuth)
 			}
+			guardedReq, guardedOpts := execReq, execOpts
+			if !countTokens {
+				guardedReq, guardedOpts = m.guardCodexTurnState(execReq, execOpts, preparedAuth)
+			}
 			execute := func() (cliproxyexecutor.Response, error) {
 				if countTokens {
 					return selection.Executor.CountTokens(executorCtx, preparedAuth, execReq, execOpts)
 				}
-				return selection.Executor.Execute(execCtx, preparedAuth, execReq, execOpts)
+				return selection.Executor.Execute(execCtx, preparedAuth, guardedReq, guardedOpts)
 			}
 			response, errExecute = execute()
 			refreshAuth := preparedAuth
@@ -173,6 +177,9 @@ func (m *Manager) executeHome(ctx context.Context, providers []string, req clipr
 				rewriteForceMappedResponse(&response, attemptAliasResult)
 				if !m.retainHomeWebsocketSelection(ctx, opts, routeModel, selection) {
 					selection.End("completed")
+				}
+				if !countTokens {
+					m.commitCodexTurnState(execOpts, preparedAuth, response.Headers, nil)
 				}
 				return response, nil
 			}

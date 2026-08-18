@@ -75,6 +75,10 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if errReplay != nil {
 		return nil, errReplay
 	}
+	body, err = helps.PrepareCodexOverdraftBody(body, opts)
+	if err != nil {
+		return nil, err
+	}
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
@@ -86,6 +90,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
 	applyModelHeaderOverrides(httpReq.Header, baseModel)
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+	applyCodexTurnStateClear(httpReq.Header, opts)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -106,12 +111,16 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
+	if errBegin := helps.BeginCodexOverdraftSend(opts); errBegin != nil {
+		return nil, errBegin
+	}
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	helps.PublishCodexQuotaHeaders(opts, authID, httpResp.Header)
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		data, readErr := io.ReadAll(httpResp.Body)
 		if errClose := httpResp.Body.Close(); errClose != nil {
@@ -179,9 +188,28 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				case "response.completed", "response.incomplete":
 					terminalSuccess = true
 					if detail, ok := helps.ParseCodexUsage(data); ok {
-						reporter.Publish(ctx, detail)
+						if errUsage := reporter.Publish(ctx, detail); errUsage != nil {
+							select {
+							case out <- cliproxyexecutor.StreamChunk{Err: cliproxyexecutor.NewUsagePersistenceError(errUsage)}:
+							case <-ctx.Done():
+							}
+							return
+						}
 					}
-					publishCodexImageToolUsage(ctx, reporter, body, data)
+					if errUsage := publishCodexImageToolUsage(ctx, reporter, body, data); errUsage != nil {
+						select {
+						case out <- cliproxyexecutor.StreamChunk{Err: cliproxyexecutor.NewUsagePersistenceError(errUsage)}:
+						case <-ctx.Done():
+						}
+						return
+					}
+					if errUsage := reporter.EnsurePublished(ctx); errUsage != nil {
+						select {
+						case out <- cliproxyexecutor.StreamChunk{Err: cliproxyexecutor.NewUsagePersistenceError(errUsage)}:
+						case <-ctx.Done():
+						}
+						return
+					}
 					data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
 					if eventType == "response.completed" {
 						cacheCodexReasoningReplayFromCompleted(replayScope, data)

@@ -81,15 +81,20 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	if errPromptCache != nil {
 		return resp, errPromptCache
 	}
+	body, err = helps.PrepareCodexOverdraftBody(body, opts)
+	if err != nil {
+		return resp, err
+	}
 	clientBody := body
 	var identityState codexIdentityConfuseState
 	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, body)
-	upstreamBody, identityState.application = applyCodexOfficialApplicationIdentity(e.cfg, auth, wsURL, upstreamBody)
+	upstreamBody, identityState.application = applyCodexOfficialApplicationIdentity(e.cfg, auth, wsURL, upstreamBody, opts.Headers)
 	upstreamBody = normalizeCodexUpstreamRequestMetadata(auth, wsURL, upstreamBody)
 	reporter.SetTranslatedReasoningEffort(clientBody, to.String())
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
 	applyModelHeaderOverrides(wsHeaders, baseModel)
 	applyCodexIdentityConfuseHeaders(wsHeaders, &identityState)
+	applyCodexTurnStateClear(wsHeaders, opts)
 
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
@@ -163,6 +168,9 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		return resp, errBind
 	}
 	recordAPIWebsocketHandshake(ctx, e.cfg, respHS)
+	if respHS != nil {
+		helps.PublishCodexQuotaHeaders(opts, authID, respHS.Header)
+	}
 	reporter.StartResponseTTFT()
 	if sess == nil {
 		logCodexWebsocketConnected(executionSessionID, authID, wsURL)
@@ -187,6 +195,9 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	}
 	restoreMultiAgentV2 := !multiAgentV2Conflict && (optimizeMultiAgentV2 || sess.isMultiAgentV2Optimized(conn))
 
+	if errBegin := helps.BeginCodexOverdraftSend(opts); errBegin != nil {
+		return resp, errBegin
+	}
 	if errSend := writeCodexWebsocketMessage(sess, conn, wsReqBody); errSend != nil {
 		errSend = mapCodexWebsocketWriteError(sess, conn, errSend)
 		if sess != nil {
@@ -220,7 +231,17 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 				}
 				readCh = sess.activate(conn)
 				restoreMultiAgentV2 = !multiAgentV2Conflict && (optimizeMultiAgentV2 || sess.isMultiAgentV2Optimized(conn))
-				wsReqBodyRetry := buildCodexWebsocketRequestBody(upstreamBody)
+				upstreamBodyRetry, errRefreshInjection := helps.RefreshCodexOverdraftInjection(upstreamBody, opts)
+				if errRefreshInjection != nil {
+					return resp, errRefreshInjection
+				}
+				if errRetryIntent := helps.BeginCodexAccountingRetry(opts); errRetryIntent != nil {
+					return resp, errRetryIntent
+				}
+				if errBeginRetry := helps.BeginCodexOverdraftSend(opts); errBeginRetry != nil {
+					return resp, errBeginRetry
+				}
+				wsReqBodyRetry := buildCodexWebsocketRequestBody(upstreamBodyRetry)
 				helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 					URL:       wsURL,
 					Method:    "WEBSOCKET",
@@ -233,6 +254,9 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 					AuthValue: authValue,
 				})
 				recordAPIWebsocketHandshake(ctx, e.cfg, respHSRetry)
+				if respHSRetry != nil {
+					helps.PublishCodexQuotaHeaders(opts, authID, respHSRetry.Header)
+				}
 				reporter.StartResponseTTFT()
 				if errSendRetry := writeCodexWebsocketMessage(sess, conn, wsReqBodyRetry); errSendRetry == nil {
 					wsReqBody = wsReqBodyRetry
@@ -320,7 +344,12 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			payload = patchCodexCompletedOutput(payload, outputItemsByIndex, outputItemsFallback)
 			cacheCodexReasoningReplayFromCompleted(replayScope, payload)
 			if detail, ok := helps.ParseCodexUsage(payload); ok {
-				reporter.Publish(ctx, detail)
+				if errUsage := reporter.Publish(ctx, detail); errUsage != nil {
+					return resp, cliproxyexecutor.NewUsagePersistenceError(errUsage)
+				}
+			}
+			if errUsage := reporter.EnsurePublished(ctx); errUsage != nil {
+				return resp, cliproxyexecutor.NewUsagePersistenceError(errUsage)
 			}
 			var param any
 			clientPayload := applyCodexIdentityExposeResponsePayload(payload, identityState)

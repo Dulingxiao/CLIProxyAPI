@@ -41,6 +41,11 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	if len(normalized) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
+	var errAdmission error
+	normalized, errAdmission = m.providersAllowedByAccounting(normalized)
+	if errAdmission != nil {
+		return cliproxyexecutor.Response{}, errAdmission
+	}
 	if m.HomeEnabled() {
 		return m.executeHome(ctx, normalized, req, opts, false)
 	}
@@ -86,6 +91,11 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 	if len(normalized) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
+	var errAdmission error
+	normalized, errAdmission = m.providersAllowedByAccounting(normalized)
+	if errAdmission != nil {
+		return cliproxyexecutor.Response{}, errAdmission
+	}
 	if m.HomeEnabled() {
 		return m.executeHome(ctx, normalized, req, opts, true)
 	}
@@ -129,6 +139,11 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	normalized := m.normalizeProviders(providers)
 	if len(normalized) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
+	}
+	var errAdmission error
+	normalized, errAdmission = m.providersAllowedByAccounting(normalized)
+	if errAdmission != nil {
+		return nil, errAdmission
 	}
 
 	_, maxRetryCredentials, maxWait := m.retrySettings()
@@ -295,17 +310,37 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		if homeMode {
 			pickOpts = withHomeAuthCount(opts, homeAuthCount)
 		}
-		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
+		attemptOpts := pickOpts
+		var overdraftExecution *cliproxyexecutor.CodexOverdraftExecution
+		var auth *Auth
+		var executor ProviderExecutor
+		var provider string
+		var errPick error
+		if execution, overdraftAuth, okOverdraft := m.acquireCodexOverdraftExecution(providers, req, pickOpts, tried); okOverdraft {
+			overdraftExecution = execution
+			auth = overdraftAuth
+			provider = "codex"
+			executor, _ = m.Executor(provider)
+			if executor == nil {
+				overdraftExecution.Release()
+				return cliproxyexecutor.Response{}, &Error{Code: "executor_not_found", Message: "executor not registered"}
+			}
+			attemptOpts = attachCodexOverdraftExecution(attemptOpts, overdraftExecution)
+		} else {
+			auth, executor, provider, errPick = m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
+		}
 		if errPick != nil {
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
 				return cliproxyexecutor.Response{}, lastErr
 			}
 			return cliproxyexecutor.Response{}, errPick
 		}
+		attemptOpts = m.attachCodexQuotaObserver(attemptOpts, auth)
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, routeModel)
 		publishSelectedAuthMetadata(opts.Metadata, auth)
+		copySelectedAuthMetadata(attemptOpts.Metadata, opts.Metadata)
 
 		tried[auth.ID] = struct{}{}
 		execCtx := ctx
@@ -317,6 +352,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 
 		models, pooled, aliasResult, routing := m.preparedExecutionModelsWithAlias(auth, routeModel)
 		if len(models) == 0 {
+			if overdraftExecution != nil {
+				overdraftExecution.Release()
+			}
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
@@ -324,11 +362,17 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
 			if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errPrepare); errCancel != nil {
+				if overdraftExecution != nil {
+					overdraftExecution.Release()
+				}
 				return cliproxyexecutor.Response{}, errCancel
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromError(errPrepare)}
 			m.MarkResult(execCtx, result)
 			lastErr = errPrepare
+			if overdraftExecution != nil {
+				overdraftExecution.Release()
+			}
 			continue
 		}
 		var authErr error
@@ -340,59 +384,104 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			if restoreExecutionModel {
 				execReq.Model = executionModel
 			}
-			execOpts := opts
+			execOpts := attemptOpts
 			var errIntercept error
 			execReq, execOpts, errIntercept = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
 			if errIntercept != nil {
+				if overdraftExecution != nil {
+					overdraftExecution.Release()
+				}
 				return cliproxyexecutor.Response{}, errIntercept
 			}
 			if !restoreExecutionModel {
 				execReq = attachResolvedAPIKeyModelInfo(routing, execReq, auth, routeModel, upstreamModel)
 			}
-			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
+			resp, errExec := m.executeAccountingAttempt(execCtx, executor, auth, execReq, execOpts)
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
+					if overdraftExecution != nil {
+						overdraftExecution.Release()
+					}
 					return cliproxyexecutor.Response{}, errCtx
 				}
 				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized); okRefresh {
 					auth = refreshed
 					didRefreshOnUnauthorized = true
-					resp, errExec = executor.Execute(execCtx, auth, execReq, execOpts)
+					resp, errExec = m.executeAccountingAttempt(execCtx, executor, auth, execReq, execOpts)
 					if errExec != nil {
 						if errCtx := execCtx.Err(); errCtx != nil {
+							if overdraftExecution != nil {
+								overdraftExecution.Release()
+							}
 							return cliproxyexecutor.Response{}, errCtx
 						}
 					}
 				}
 			}
+			if cliproxyexecutor.IsUpstreamNotDispatched(errExec) {
+				delete(attempted, auth.ID)
+				if overdraftExecution != nil {
+					overdraftExecution.Release()
+				}
+				authErr = errExec
+				break
+			}
 			if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errExec); errCancel != nil {
+				if overdraftExecution != nil {
+					overdraftExecution.Release()
+				}
 				return cliproxyexecutor.Response{}, errCancel
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
 				result.Error = resultErrorFromError(errExec)
+				if overdraftExecution != nil {
+					if isCodexUsageLimitError(result.Error) {
+						_ = overdraftExecution.BusinessUsageLimited()
+					} else {
+						_ = overdraftExecution.BusinessCompleted()
+					}
+				}
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
 				}
 				m.MarkResult(execCtx, result)
 				if isRequestInvalidError(errExec) {
+					if overdraftExecution != nil {
+						overdraftExecution.Release()
+					}
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
+				if overdraftExecution != nil {
+					delete(attempted, auth.ID)
+					break
+				}
 				continue
 			}
 			m.MarkResult(execCtx, result)
+			if overdraftExecution != nil {
+				_ = overdraftExecution.BusinessCompleted()
+				overdraftExecution.Release()
+			}
 			attemptAliasResult := resolveAttemptAliasResult(routing, auth, routeModel, upstreamModel, aliasResult)
 			rewriteForceMappedResponse(&resp, attemptAliasResult)
+			m.commitCodexTurnState(execOpts, auth, resp.Headers, nil)
 			return resp, nil
 		}
 		if authErr != nil {
 			if isRequestInvalidError(authErr) {
+				if overdraftExecution != nil {
+					overdraftExecution.Release()
+				}
 				return cliproxyexecutor.Response{}, authErr
 			}
 			lastErr = authErr
 			if homeMode {
 				homeAuthCount++
+			}
+			if overdraftExecution != nil {
+				overdraftExecution.Release()
 			}
 			continue
 		}
@@ -441,6 +530,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
 		execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
+		execCtx = accountingContextForExecution(execCtx, opts)
 
 		models, pooled, aliasResult, routing := m.preparedExecutionModelsWithAlias(auth, routeModel)
 		if len(models) == 0 {
@@ -559,6 +649,8 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		if homeMode {
 			pickOpts = withHomeAuthCount(opts, homeAuthCount)
 		}
+		attemptOpts := pickOpts
+		var overdraftExecution *cliproxyexecutor.CodexOverdraftExecution
 
 		var selection *HomeDispatchSelection
 		var auth *Auth
@@ -572,6 +664,12 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				executor = selection.Executor
 				provider = selection.Provider
 			}
+		} else if execution, overdraftAuth, okOverdraft := m.acquireCodexOverdraftExecution(providers, req, pickOpts, tried); okOverdraft {
+			overdraftExecution = execution
+			auth = overdraftAuth
+			provider = "codex"
+			executor, _ = m.Executor(provider)
+			attemptOpts = attachCodexOverdraftExecution(attemptOpts, overdraftExecution)
 		} else {
 			auth, executor, provider, errPick = m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
 		}
@@ -582,11 +680,15 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			return nil, errPick
 		}
 		if auth == nil || executor == nil {
+			if overdraftExecution != nil {
+				overdraftExecution.Release()
+			}
 			if selection != nil {
 				selection.End("missing_execution_target")
 			}
 			return nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 		}
+		attemptOpts = m.attachCodexQuotaObserver(attemptOpts, auth)
 		if selection != nil {
 			if _, refreshedAlready := unauthorizedRefreshTried[auth.ID]; refreshedAlready {
 				selection.End("repeated_refresh_auth")
@@ -606,6 +708,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 		}
 		publishSelectedAuthMetadata(opts.Metadata, auth)
+		copySelectedAuthMetadata(attemptOpts.Metadata, opts.Metadata)
 
 		tried[auth.ID] = struct{}{}
 		execCtx := ctx
@@ -629,6 +732,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			aliasResult.OriginalAlias = responseAlias
 		}
 		if len(models) == 0 {
+			if overdraftExecution != nil {
+				overdraftExecution.Release()
+			}
 			if selection != nil {
 				releaseAttempt()
 				if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, selection, "no_execution_models"); errEnd != nil {
@@ -647,6 +753,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		if errPrepare != nil {
 			if selection == nil {
 				if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errPrepare); errCancel != nil {
+					if overdraftExecution != nil {
+						overdraftExecution.Release()
+					}
 					return nil, errCancel
 				}
 			}
@@ -658,6 +767,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				m.MarkResult(execCtx, result)
 			}
 			lastErr = errPrepare
+			if overdraftExecution != nil {
+				overdraftExecution.Release()
+			}
 			if selection != nil {
 				if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, selection, "prepare_failed"); errEnd != nil {
 					return nil, errEnd
@@ -670,7 +782,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		if restoreExecutionModel {
 			streamExecutionModel = executionModel
 		}
-		execOpts := opts
+		execOpts := attemptOpts
 		if selection != nil {
 			execOpts.ExecutionLifecycle = selection
 		}
@@ -680,6 +792,10 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, execOpts, routeModel, streamExecutionModel, models, pooled, aliasResult, routing, !homeMode || selection != nil, selection != nil, unauthorizedRefreshTried)
 		if errStream != nil {
+			finishCodexOverdraftExecution(overdraftExecution, errStream)
+			if overdraftExecution != nil || cliproxyexecutor.IsUpstreamNotDispatched(errStream) {
+				delete(attempted, auth.ID)
+			}
 			if selection != nil {
 				releaseAttempt()
 				if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, selection, "stream_start_failed"); errEnd != nil {
@@ -704,7 +820,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			return wrapHomeStream(ctx, streamResult, selection, releaseAttempt), nil
 		}
-		return streamResult, nil
+		return wrapCodexOverdraftStream(ctx, streamResult, overdraftExecution), nil
 	}
 }
 
@@ -1079,6 +1195,20 @@ func publishSelectedAuthMetadata(meta map[string]any, auth *Auth) {
 		meta[cliproxyexecutor.SelectedAuthIndexMetadataKey] = authIndex
 		if callback, ok := meta[cliproxyexecutor.SelectedAuthIndexCallbackMetadataKey].(func(string)); ok && callback != nil {
 			callback(authIndex)
+		}
+	}
+}
+
+func copySelectedAuthMetadata(dst, src map[string]any) {
+	if dst == nil || src == nil {
+		return
+	}
+	for _, key := range []string{
+		cliproxyexecutor.SelectedAuthMetadataKey,
+		cliproxyexecutor.SelectedAuthIndexMetadataKey,
+	} {
+		if value, ok := src[key]; ok {
+			dst[key] = value
 		}
 	}
 }

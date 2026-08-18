@@ -94,6 +94,13 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	m.queueRefreshReschedule(auth.ID)
 	_ = m.persist(ctx, auth)
 	m.hook.OnAuthRegistered(ctx, auth.Clone())
+	m.syncCodexOverdraftAuth(auth)
+	if isCodexQuotaEligibleAuth(auth) {
+		m.restoreCodexQuotaSnapshotForAuth(auth)
+		m.scheduleCodexQuotaRefresh(auth.ID, 0)
+	} else {
+		m.cancelCodexQuotaRefresh(auth.ID)
+	}
 	if cooldownStateChanged {
 		m.persistCooldownStates(ctx)
 	}
@@ -144,6 +151,11 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	m.queueRefreshReschedule(auth.ID)
 	_ = m.persist(ctx, auth)
 	m.hook.OnAuthUpdated(ctx, auth.Clone())
+	m.syncCodexOverdraftAuth(auth)
+	if isCodexQuotaEligibleAuth(auth) {
+		m.restoreCodexQuotaSnapshotForAuth(auth)
+		m.scheduleCodexQuotaRefresh(auth.ID, 0)
+	}
 	if cooldownStateChanged {
 		m.persistCooldownStates(ctx)
 	}
@@ -170,6 +182,7 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 	}
 	provider := strings.TrimSpace(existing.Provider)
 	delete(m.auths, id)
+	delete(m.upstreamFailures, id)
 	if m.modelPoolOffsets != nil {
 		delete(m.modelPoolOffsets, id)
 	}
@@ -192,6 +205,7 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 	}
 	m.queueRefreshUnschedule(id)
 	m.invalidateSessionAffinity(id)
+	m.removeCodexOverdraftAuth(id)
 
 	if provider != "" {
 		if exec, ok := m.Executor(provider); ok && exec != nil {
@@ -242,6 +256,13 @@ func (m *Manager) Load(ctx context.Context) error {
 	m.rebuildAPIKeyModelAliasLocked(cfg)
 	m.mu.Unlock()
 	m.syncScheduler()
+	for _, auth := range m.snapshotAuths() {
+		m.syncCodexOverdraftAuth(auth)
+		if isCodexQuotaEligibleAuth(auth) {
+			m.restoreCodexQuotaSnapshotForAuth(auth)
+			m.scheduleCodexQuotaStartupRefresh(auth.ID)
+		}
+	}
 	return nil
 }
 

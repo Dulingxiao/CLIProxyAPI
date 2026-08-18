@@ -497,6 +497,32 @@ func TestSelectorPick_AllCooldownReturnsModelCooldownError(t *testing.T) {
 	})
 }
 
+func TestGetAvailableAuthsCooldownWithDisabledSiblingReturnsRetry(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	auths := []*Auth{
+		{
+			ID:       "cool",
+			Provider: "codex",
+			ModelStates: map[string]*ModelState{
+				"gpt-5.6-sol": {
+					Unavailable:    true,
+					NextRetryAfter: now.Add(3 * time.Minute),
+					Quota:          QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: now.Add(3 * time.Minute)},
+				},
+			},
+		},
+		{ID: "off", Provider: "codex", Disabled: true, Status: StatusDisabled},
+	}
+
+	_, errAvailable := getAvailableAuths(auths, "codex", "gpt-5.6-sol", now)
+	var cooldownErr *modelCooldownError
+	if !errors.As(errAvailable, &cooldownErr) {
+		t.Fatalf("error = %T %v, want model cooldown", errAvailable, errAvailable)
+	}
+}
+
 func TestIsAuthBlockedForModel_UnavailableWithoutNextRetryIsBlocked(t *testing.T) {
 	t.Parallel()
 

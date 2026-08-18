@@ -111,11 +111,20 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Codex.IdentityConfuse != newCfg.Codex.IdentityConfuse {
 		changes = append(changes, fmt.Sprintf("codex.identity-confuse: %t -> %t", oldCfg.Codex.IdentityConfuse, newCfg.Codex.IdentityConfuse))
 	}
+	if oldCfg.Codex.FingerprintMode != newCfg.Codex.FingerprintMode {
+		changes = append(changes, fmt.Sprintf("codex.fingerprint-mode: %s -> %s", oldCfg.Codex.FingerprintMode, newCfg.Codex.FingerprintMode))
+	}
 	if oldCfg.Codex.DisableCodexCloaking != newCfg.Codex.DisableCodexCloaking {
 		changes = append(changes, fmt.Sprintf("codex.disable-codex-cloaking: %t -> %t", oldCfg.Codex.DisableCodexCloaking, newCfg.Codex.DisableCodexCloaking))
 	}
 	if oldCfg.Codex.DisableFingerprintAutoSync != newCfg.Codex.DisableFingerprintAutoSync {
 		changes = append(changes, fmt.Sprintf("codex.disable-fingerprint-auto-sync: %t -> %t", oldCfg.Codex.DisableFingerprintAutoSync, newCfg.Codex.DisableFingerprintAutoSync))
+	}
+	if strings.TrimSpace(oldCfg.Codex.TLSProfile) != strings.TrimSpace(newCfg.Codex.TLSProfile) {
+		changes = append(changes, fmt.Sprintf("codex.tls-profile: %s -> %s", displayOptionalValue(oldCfg.Codex.TLSProfile), displayOptionalValue(newCfg.Codex.TLSProfile)))
+	}
+	if oldCfg.Codex.TLSReuseConnections != newCfg.Codex.TLSReuseConnections {
+		changes = append(changes, fmt.Sprintf("codex.tls-reuse-connections: %t -> %t", oldCfg.Codex.TLSReuseConnections, newCfg.Codex.TLSReuseConnections))
 	}
 	if oldCfg.Codex.OptimizeMultiAgentV2 != newCfg.Codex.OptimizeMultiAgentV2 {
 		changes = append(changes, fmt.Sprintf("codex.optimize-multi-agent-v2: %t -> %t", oldCfg.Codex.OptimizeMultiAgentV2, newCfg.Codex.OptimizeMultiAgentV2))

@@ -270,6 +270,7 @@ func TestServiceReplacementWaitsForPublisherExitAndPinsACKedLifetimeDependencies
 	service.coreManager = coreauth.NewManager(nil, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
+	t.Cleanup(service.coreManager.StopCodexQuota)
 	service.startHomeSubscriber(ctx)
 
 	firstFrame := waitForPublisherReplacementFrame(t, frames, 11)

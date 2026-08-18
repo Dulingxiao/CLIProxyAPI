@@ -2,6 +2,7 @@ package helps
 
 import (
 	"context"
+	stdtls "crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -352,6 +353,191 @@ type fallbackRoundTripper struct {
 	fallback  http.RoundTripper
 }
 
+const codexRoundTripperCacheCapacity = 128
+
+var codexRoundTripperCache = internalcache.NewBoundedLRU[string, http.RoundTripper](
+	codexRoundTripperCacheCapacity,
+	func(_ string, roundTripper http.RoundTripper) {
+		if transport, ok := roundTripper.(interface{ CloseIdleConnections() }); ok {
+			transport.CloseIdleConnections()
+		}
+	},
+)
+
+// CodexTLSProfileForAuth resolves Auth > global > default transport policy.
+func CodexTLSProfileForAuth(cfg *config.Config, auth *cliproxyauth.Auth) string {
+	profile := ""
+	if auth != nil && auth.Attributes != nil {
+		profile = strings.TrimSpace(auth.Attributes["tls-profile"])
+		if profile == "" {
+			profile = strings.TrimSpace(auth.Attributes["codex_tls_profile"])
+		}
+	}
+	if profile == "" && auth != nil && auth.Metadata != nil {
+		profile, _ = auth.Metadata["tls-profile"].(string)
+		if strings.TrimSpace(profile) == "" {
+			profile, _ = auth.Metadata["codex_tls_profile"].(string)
+		}
+	}
+	profile = strings.ToLower(strings.TrimSpace(profile))
+	if !validCodexTLSProfile(profile) {
+		profile = ""
+	}
+	if profile == "" && cfg != nil {
+		profile = strings.ToLower(strings.TrimSpace(cfg.Codex.TLSProfile))
+	}
+	if !validCodexTLSProfile(profile) {
+		return config.DefaultCodexTLSProfile
+	}
+	return profile
+}
+
+func validCodexTLSProfile(profile string) bool {
+	switch profile {
+	case config.CodexTLSProfileChrome, config.CodexTLSProfileSafariLike, config.CodexTLSProfileGoStandard:
+		return true
+	default:
+		return false
+	}
+}
+
+func codexTLSReuseConnections(cfg *config.Config) bool {
+	return cfg == nil || cfg.Codex.TLSReuseConnections
+}
+
+func codexClientHelloID(profile string) tls.ClientHelloID {
+	if profile == config.CodexTLSProfileSafariLike {
+		// uTLS Safari 16 is the maintained WebKit/macOS-like profile used for
+		// the edge A-B lane; refresh it when uTLS updates HelloSafari_Auto.
+		return tls.HelloSafari_Auto
+	}
+	// Chrome_Auto preserves the pre-existing project behavior and is the
+	// default A-B lane.
+	return tls.HelloChrome_Auto
+}
+
+func cachedCodexRoundTripper(proxyURL, authID, profile string, reuse bool) http.RoundTripper {
+	key := strings.Join([]string{authID, proxyURL, profile}, "\x00")
+	create := func() http.RoundTripper { return newCodexRoundTripper(proxyURL, profile, reuse) }
+	if !reuse {
+		return create()
+	}
+	return codexRoundTripperCache.GetOrAdd(key, create)
+}
+
+func newCodexRoundTripper(proxyURL, profile string, reuse bool) http.RoundTripper {
+	return newCodexRoundTripperWithTLS(proxyURL, profile, reuse, nil)
+}
+
+func newCodexRoundTripperWithTLS(proxyURL, profile string, reuse bool, tlsOpt *tls.Config) http.RoundTripper {
+	if profile == config.CodexTLSProfileGoStandard {
+		var transport *http.Transport
+		if proxyURL != "" {
+			transport = buildProxyTransport(proxyURL)
+		}
+		if transport == nil {
+			transport = http.DefaultTransport.(*http.Transport).Clone()
+		}
+		transport.DisableKeepAlives = !reuse
+		if tlsOpt != nil {
+			if transport.TLSClientConfig == nil {
+				transport.TLSClientConfig = &stdtls.Config{}
+			}
+			transport.TLSClientConfig.InsecureSkipVerify = tlsOpt.InsecureSkipVerify
+		}
+		return transport
+	}
+
+	var dialer proxy.Dialer = proxy.Direct
+	if proxyURL != "" {
+		proxyDialer, mode, errBuild := proxyutil.BuildDialer(proxyURL)
+		if errBuild != nil {
+			log.Errorf("codex tls: failed to configure proxy dialer for %q: %v", proxyutil.Redact(proxyURL), errBuild)
+		} else if mode != proxyutil.ModeInherit && proxyDialer != nil {
+			dialer = proxyDialer
+		}
+	}
+	sessionCache := tls.NewLRUClientSessionCache(32)
+	insecureSkipVerify := tlsOpt != nil && tlsOpt.InsecureSkipVerify
+	// net/http only promotes a custom DialTLSContext connection to HTTP/2 when
+	// the conn is *crypto/tls.Conn. uTLS returns *tls.UConn, so Chrome ALPN
+	// negotiates h2 while the standard transport still writes HTTP/1.1.
+	// Speak HTTP/2 on the already-handshaked uTLS connection instead.
+	transport := &http2.Transport{
+		DialTLSContext: func(ctx context.Context, network, addr string, _ *stdtls.Config) (net.Conn, error) {
+			tlsConn, errDial := dialCodexUTLS(ctx, dialer, addr, profile, sessionCache, insecureSkipVerify)
+			if errDial != nil {
+				return nil, errDial
+			}
+			proto := tlsConn.ConnectionState().NegotiatedProtocol
+			if proto != "h2" && proto != "" {
+				_ = tlsConn.Close()
+				return nil, fmt.Errorf("codex tls: negotiated ALPN %q, want h2", proto)
+			}
+			return tlsConn, nil
+		},
+	}
+	if reuse {
+		return transport
+	}
+	return &closeIdleRoundTripper{inner: transport}
+}
+
+type closeIdleRoundTripper struct {
+	inner interface {
+		http.RoundTripper
+		CloseIdleConnections()
+	}
+}
+
+func (t *closeIdleRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, errRoundTrip := t.inner.RoundTrip(req)
+	if errRoundTrip != nil {
+		t.inner.CloseIdleConnections()
+		return nil, errRoundTrip
+	}
+	if resp == nil {
+		t.inner.CloseIdleConnections()
+		return nil, fmt.Errorf("codex tls: upstream returned an empty response")
+	}
+	if resp.Body == nil {
+		resp.Body = http.NoBody
+	}
+	resp.Body = &closeConnectionBody{
+		ReadCloser:      resp.Body,
+		closeConnection: func() error { t.inner.CloseIdleConnections(); return nil },
+	}
+	return resp, nil
+}
+
+func dialCodexUTLS(ctx context.Context, dialer proxy.Dialer, addr, profile string, sessionCache tls.ClientSessionCache, insecureSkipVerify bool) (*tls.UConn, error) {
+	contextDialer, ok := dialer.(proxy.ContextDialer)
+	if !ok {
+		return nil, fmt.Errorf("codex tls: dialer does not support context cancellation")
+	}
+	conn, errDial := contextDialer.DialContext(ctx, "tcp", addr)
+	if errDial != nil {
+		return nil, fmt.Errorf("codex tls: dial upstream: %w", errDial)
+	}
+	host, _, errSplit := net.SplitHostPort(addr)
+	if errSplit != nil {
+		host = addr
+	}
+	tlsConfig := &tls.Config{
+		ServerName:                         host,
+		ClientSessionCache:                 sessionCache,
+		InsecureSkipVerify:                 insecureSkipVerify,
+		OmitEmptyPsk:                       true,
+		PreferSkipResumptionOnNilExtension: true,
+	}
+	tlsConn := tls.UClient(conn, tlsConfig, codexClientHelloID(profile))
+	if errHandshake := tlsConn.HandshakeContext(ctx); errHandshake != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("codex tls: handshake upstream: %w", errHandshake)
+	}
+	return tlsConn, nil
+}
+
 func (f *fallbackRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	if IsAnthropicUpstreamURL(req.URL) {
 		return f.anthropic.RoundTrip(req)
@@ -380,7 +566,13 @@ func NewUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyau
 		ctxRoundTripper, _ = ctx.Value("cliproxy.roundtripper").(http.RoundTripper)
 	}
 
-	var chromeRT http.RoundTripper = newUtlsRoundTripper(proxyURL)
+	profile := CodexTLSProfileForAuth(cfg, auth)
+	reuse := codexTLSReuseConnections(cfg)
+	authID := ""
+	if auth != nil {
+		authID = strings.TrimSpace(auth.ID)
+	}
+	var chromeRT http.RoundTripper = cachedCodexRoundTripper(proxyURL, authID, profile, reuse)
 	var anthropicRT http.RoundTripper = cachedClaudeCodeRoundTripper(proxyURL)
 	var standardTransport http.RoundTripper = http.DefaultTransport
 	if proxyURL != "" {
@@ -409,10 +601,28 @@ func NewUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyau
 // NewUTLSWebsocketDialContext creates a TLS dial function that uses a Chrome
 // ClientHello while keeping WebSocket traffic on HTTP/1.1.
 func NewUTLSWebsocketDialContext(proxyURL string) (func(context.Context, string, string) (net.Conn, error), error) {
-	return newUTLSWebsocketDialContext(proxyURL, nil)
+	return newUTLSWebsocketDialContextForProfile(proxyURL, nil, config.CodexTLSProfileChrome, nil)
 }
 
 func newUTLSWebsocketDialContext(proxyURL string, tlsConfig *tls.Config) (func(context.Context, string, string) (net.Conn, error), error) {
+	return newUTLSWebsocketDialContextForProfile(proxyURL, tlsConfig, config.CodexTLSProfileChrome, nil)
+}
+
+var codexWebsocketSessionCaches = internalcache.NewBoundedLRU[string, tls.ClientSessionCache](128, nil)
+
+// NewUTLSWebsocketDialContextForProfile selects the Codex A-B ClientHello and
+// optionally reuses TLS sessions only inside the supplied auth/proxy scope.
+func NewUTLSWebsocketDialContextForProfile(proxyURL, profile, cacheKey string, reuse bool) (func(context.Context, string, string) (net.Conn, error), error) {
+	var sessionCache tls.ClientSessionCache
+	if reuse {
+		sessionCache = codexWebsocketSessionCaches.GetOrAdd(cacheKey, func() tls.ClientSessionCache {
+			return tls.NewLRUClientSessionCache(32)
+		})
+	}
+	return newUTLSWebsocketDialContextForProfile(proxyURL, nil, profile, sessionCache)
+}
+
+func newUTLSWebsocketDialContextForProfile(proxyURL string, tlsConfig *tls.Config, profile string, sessionCache tls.ClientSessionCache) (func(context.Context, string, string) (net.Conn, error), error) {
 	baseDialer, mode, errBuild := proxyutil.BuildDialer(proxyURL)
 	if errBuild != nil {
 		return nil, fmt.Errorf("build websocket proxy dialer: %w", errBuild)
@@ -443,8 +653,11 @@ func newUTLSWebsocketDialContext(proxyURL string, tlsConfig *tls.Config) (func(c
 			host = addr
 		}
 		configForConn.ServerName = host
+		configForConn.ClientSessionCache = sessionCache
+		configForConn.OmitEmptyPsk = true
+		configForConn.PreferSkipResumptionOnNilExtension = true
 
-		spec, errSpec := codexChromeWebsocketClientHelloSpec()
+		spec, errSpec := codexWebsocketClientHelloSpec(profile)
 		if errSpec != nil {
 			_ = rawConn.Close()
 			return nil, fmt.Errorf("build Chrome websocket ClientHello: %w", errSpec)
@@ -463,7 +676,11 @@ func newUTLSWebsocketDialContext(proxyURL string, tlsConfig *tls.Config) (func(c
 }
 
 func codexChromeWebsocketClientHelloSpec() (tls.ClientHelloSpec, error) {
-	spec, errSpec := tls.UTLSIdToSpec(tls.HelloChrome_Auto)
+	return codexWebsocketClientHelloSpec(config.CodexTLSProfileChrome)
+}
+
+func codexWebsocketClientHelloSpec(profile string) (tls.ClientHelloSpec, error) {
+	spec, errSpec := tls.UTLSIdToSpec(codexClientHelloID(profile))
 	if errSpec != nil {
 		return tls.ClientHelloSpec{}, errSpec
 	}

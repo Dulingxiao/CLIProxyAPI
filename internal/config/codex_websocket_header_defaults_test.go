@@ -32,6 +32,9 @@ codex-header-defaults:
 	if cfg.Codex.DisableCodexCloaking {
 		t.Fatal("DisableCodexCloaking = true, want default false")
 	}
+	if cfg.Codex.FingerprintMode != "off" {
+		t.Fatalf("FingerprintMode = %q, want off", cfg.Codex.FingerprintMode)
+	}
 }
 
 func TestLoadConfigOptional_CodexIdentityConfuse(t *testing.T) {
@@ -40,6 +43,7 @@ func TestLoadConfigOptional_CodexIdentityConfuse(t *testing.T) {
 	configYAML := []byte(`
 codex:
   identity-confuse: true
+  fingerprint-mode: session
   disable-codex-cloaking: true
   disable-fingerprint-auto-sync: true
   optimize-multi-agent-v2: true
@@ -55,6 +59,9 @@ codex:
 
 	if !cfg.Codex.IdentityConfuse {
 		t.Fatalf("IdentityConfuse = false, want true")
+	}
+	if cfg.Codex.FingerprintMode != "session" {
+		t.Fatalf("FingerprintMode = %q, want session", cfg.Codex.FingerprintMode)
 	}
 	if !cfg.Codex.DisableCodexCloaking {
 		t.Fatal("DisableCodexCloaking = false, want true")

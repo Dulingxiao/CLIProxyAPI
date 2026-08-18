@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -152,6 +153,10 @@ func fetchCodexFingerprintProfile(
 	if errConstant != nil {
 		return CodexFingerprintProfile{}, errConstant
 	}
+	residencyHeader := base.Headers.Residency
+	if extracted, errResidency := extractRustStringConstant(clientSource, "RESIDENCY_HEADER_NAME"); errResidency == nil {
+		residencyHeader = extracted
+	}
 	turnMetadataHeader, errConstant := extractRustStringConstant(clientSource, "X_CODEX_TURN_METADATA_HEADER")
 	if errConstant != nil {
 		return CodexFingerprintProfile{}, errConstant
@@ -178,6 +183,24 @@ func fetchCodexFingerprintProfile(
 	}
 	if !strings.Contains(string(clientSource), "\"x-client-request-id\"") {
 		return CodexFingerprintProfile{}, fmt.Errorf("client source is missing x-client-request-id")
+	}
+	headerConstants := map[string]string{
+		"RESIDENCY_HEADER_NAME":                        residencyHeader,
+		"X_CODEX_INSTALLATION_ID_HEADER":               installationHeader,
+		"X_CODEX_TURN_STATE_HEADER":                    turnStateHeader,
+		"X_CODEX_TURN_METADATA_HEADER":                 turnMetadataHeader,
+		"X_CODEX_PARENT_THREAD_ID_HEADER":              parentThreadHeader,
+		"X_CODEX_WINDOW_ID_HEADER":                     windowHeader,
+		"X_OPENAI_SUBAGENT_HEADER":                     subagentHeader,
+		"X_RESPONSESAPI_INCLUDE_TIMING_METRICS_HEADER": timingHeader,
+	}
+	httpHeaderNames, errHeaders := extractCodexTransportHeaderNames(clientSource, []string{"build_responses_headers", "build_subagent_headers"}, headerConstants)
+	if errHeaders != nil {
+		return CodexFingerprintProfile{}, fmt.Errorf("extract HTTP Codex header contract: %w", errHeaders)
+	}
+	websocketHeaderNames, errHeaders := extractFirstCodexTransportHeaderNames(clientSource, []string{"build_websocket_headers", "build_responses_websocket_headers", "connect_websocket"}, headerConstants)
+	if errHeaders != nil {
+		return CodexFingerprintProfile{}, fmt.Errorf("extract websocket Codex header contract: %w", errHeaders)
 	}
 
 	metadataSource, errFetch := fetchCodexFingerprintSource(ctx, client, sources.ResponsesMetadataURL, "responses metadata source")
@@ -223,7 +246,12 @@ func fetchCodexFingerprintProfile(
 	candidate.Version = version
 	candidate.Originator = originator
 	candidate.WebsocketBeta = websocketBeta
+	candidate.HTTPHeaderNames = httpHeaderNames
+	candidate.WebsocketHeaderNames = websocketHeaderNames
+	candidate.HeaderPolicy = "omit_uncertain"
 	candidate.Headers = CodexFingerprintHeaders{
+		Attestation:     "x-oai-attestation",
+		Residency:       residencyHeader,
 		InstallationID:  installationHeader,
 		TurnState:       turnStateHeader,
 		TurnMetadata:    turnMetadataHeader,
@@ -251,6 +279,82 @@ func fetchCodexFingerprintProfile(
 		return CodexFingerprintProfile{}, errValidate
 	}
 	return candidate, nil
+}
+
+func extractCodexTransportHeaderNames(source []byte, functions []string, constants map[string]string) ([]string, error) {
+	names := make(map[string]struct{})
+	for _, function := range functions {
+		body, errBody := extractRustFunctionBody(source, function)
+		if errBody != nil {
+			return nil, errBody
+		}
+		collectRustHeaderNames(body, constants, names)
+	}
+	if len(names) == 0 {
+		return nil, fmt.Errorf("official Codex functions %s contain no header names", strings.Join(functions, ","))
+	}
+	return sortedStringSet(names), nil
+}
+
+func extractFirstCodexTransportHeaderNames(source []byte, functions []string, constants map[string]string) ([]string, error) {
+	for _, function := range functions {
+		body, errBody := extractRustFunctionBody(source, function)
+		if errBody != nil {
+			continue
+		}
+		names := make(map[string]struct{})
+		collectRustHeaderNames(body, constants, names)
+		if len(names) > 0 {
+			return sortedStringSet(names), nil
+		}
+	}
+	return nil, fmt.Errorf("official Codex source contains no recognized websocket header function")
+}
+
+func extractRustFunctionBody(source []byte, name string) ([]byte, error) {
+	functionPattern := regexp.MustCompile(`(?m)(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+` + regexp.QuoteMeta(name) + `\s*\([^)]*\)[^{]*\{`)
+	location := functionPattern.FindIndex(source)
+	if location == nil {
+		return nil, fmt.Errorf("official Codex source is missing %s", name)
+	}
+	start := location[1] - 1
+	depth := 0
+	for index := start; index < len(source); index++ {
+		switch source[index] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return source[start+1 : index], nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("official Codex function %s has no closing brace", name)
+}
+
+func collectRustHeaderNames(body []byte, constants map[string]string, names map[string]struct{}) {
+	text := string(body)
+	for constant, value := range constants {
+		if strings.Contains(text, constant) {
+			names[strings.ToLower(strings.TrimSpace(value))] = struct{}{}
+		}
+	}
+	for _, match := range regexp.MustCompile(`"([A-Za-z0-9_-]+)"`).FindAllSubmatch(body, -1) {
+		value := strings.ToLower(strings.TrimSpace(string(match[1])))
+		if strings.Contains(value, "-") {
+			names[value] = struct{}{}
+		}
+	}
+}
+
+func sortedStringSet(values map[string]struct{}) []string {
+	result := make([]string, 0, len(values))
+	for value := range values {
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
 }
 
 func fetchCodexFingerprintSource(ctx context.Context, client *http.Client, sourceURL, label string) ([]byte, error) {

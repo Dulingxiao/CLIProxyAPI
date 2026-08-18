@@ -19,6 +19,8 @@ var embeddedCodexFingerprintProfileJSON []byte
 // CodexFingerprintHeaders names the application identity headers used by the
 // official Codex Responses HTTP and websocket transports.
 type CodexFingerprintHeaders struct {
+	Attestation     string `json:"attestation"`
+	Residency       string `json:"residency"`
 	InstallationID  string `json:"installation_id"`
 	TurnState       string `json:"turn_state"`
 	TurnMetadata    string `json:"turn_metadata"`
@@ -30,6 +32,11 @@ type CodexFingerprintHeaders struct {
 	SessionID       string `json:"session_id"`
 	ThreadID        string `json:"thread_id"`
 }
+
+// minimumCodexFingerprintVersion is the oldest release verified against the
+// current ChatGPT application-identity gate. Updater failures retain the last
+// accepted profile rather than publishing an older release.
+const minimumCodexFingerprintVersion = "0.146.0"
 
 // CodexFingerprintMetadataKeys names the Codex-owned fields inside canonical
 // turn metadata.
@@ -49,14 +56,17 @@ type CodexFingerprintMetadataKeys struct {
 // CodexFingerprintProfile is a validated snapshot of the official Codex
 // application request contract.
 type CodexFingerprintProfile struct {
-	SchemaVersion     int                          `json:"schema_version"`
-	SourceRevision    string                       `json:"source_revision"`
-	Version           string                       `json:"version"`
-	Originator        string                       `json:"originator"`
-	UserAgentTemplate string                       `json:"user_agent_template"`
-	WebsocketBeta     string                       `json:"websocket_beta"`
-	Headers           CodexFingerprintHeaders      `json:"headers"`
-	MetadataKeys      CodexFingerprintMetadataKeys `json:"metadata_keys"`
+	SchemaVersion        int                          `json:"schema_version"`
+	SourceRevision       string                       `json:"source_revision"`
+	Version              string                       `json:"version"`
+	Originator           string                       `json:"originator"`
+	UserAgentTemplate    string                       `json:"user_agent_template"`
+	WebsocketBeta        string                       `json:"websocket_beta"`
+	Headers              CodexFingerprintHeaders      `json:"headers"`
+	MetadataKeys         CodexFingerprintMetadataKeys `json:"metadata_keys"`
+	HTTPHeaderNames      []string                     `json:"http_header_names"`
+	WebsocketHeaderNames []string                     `json:"websocket_header_names"`
+	HeaderPolicy         string                       `json:"header_policy"`
 }
 
 // UserAgent expands the profile's coherent originator and release version.
@@ -104,7 +114,7 @@ func GetCodexFingerprintProfileSnapshot() (CodexFingerprintProfile, uint64) {
 func (store *codexFingerprintProfileStore) snapshot() (CodexFingerprintProfile, uint64) {
 	store.mu.RLock()
 	defer store.mu.RUnlock()
-	return store.profile, store.revision
+	return cloneCodexFingerprintProfile(store.profile), store.revision
 }
 
 func loadCodexFingerprintProfileFromBytes(data []byte, source string) (bool, error) {
@@ -137,7 +147,7 @@ func (store *codexFingerprintProfileStore) update(candidate CodexFingerprintProf
 	if bytes.Equal(currentJSON, candidateJSON) {
 		return false, nil
 	}
-	store.profile = candidate
+	store.profile = cloneCodexFingerprintProfile(candidate)
 	store.revision++
 	return true, nil
 }
@@ -152,6 +162,11 @@ func validateCodexFingerprintProfile(profile CodexFingerprintProfile) error {
 	if _, err := parseCodexReleaseVersion(profile.Version); err != nil {
 		return err
 	}
+	if comparison, errCompare := compareCodexReleaseVersions(profile.Version, minimumCodexFingerprintVersion); errCompare != nil {
+		return errCompare
+	} else if comparison < 0 {
+		return fmt.Errorf("Codex fingerprint version %s is below minimum %s", profile.Version, minimumCodexFingerprintVersion)
+	}
 	if strings.TrimSpace(profile.Originator) == "" || !httpguts.ValidHeaderFieldValue(profile.Originator) {
 		return fmt.Errorf("Codex fingerprint originator is invalid")
 	}
@@ -164,8 +179,29 @@ func validateCodexFingerprintProfile(profile CodexFingerprintProfile) error {
 	if !strings.HasPrefix(strings.TrimSpace(profile.WebsocketBeta), "responses_websockets=") {
 		return fmt.Errorf("Codex fingerprint websocket beta is invalid")
 	}
+	if profile.HeaderPolicy != "omit_uncertain" {
+		return fmt.Errorf("Codex fingerprint header policy %q is unsupported", profile.HeaderPolicy)
+	}
+	for label, names := range map[string][]string{"HTTP": profile.HTTPHeaderNames, "websocket": profile.WebsocketHeaderNames} {
+		if len(names) == 0 {
+			return fmt.Errorf("Codex fingerprint %s header set is empty", label)
+		}
+		seen := make(map[string]struct{}, len(names))
+		for _, name := range names {
+			name = strings.ToLower(strings.TrimSpace(name))
+			if !httpguts.ValidHeaderFieldName(name) {
+				return fmt.Errorf("Codex fingerprint %s header name %q is invalid", label, name)
+			}
+			if _, exists := seen[name]; exists {
+				return fmt.Errorf("Codex fingerprint %s header name %q is duplicated", label, name)
+			}
+			seen[name] = struct{}{}
+		}
+	}
 
 	headers := []string{
+		profile.Headers.Attestation,
+		profile.Headers.Residency,
 		profile.Headers.InstallationID,
 		profile.Headers.TurnState,
 		profile.Headers.TurnMetadata,
@@ -214,6 +250,12 @@ func validateCodexFingerprintProfile(profile CodexFingerprintProfile) error {
 		seenMetadata[key] = struct{}{}
 	}
 	return nil
+}
+
+func cloneCodexFingerprintProfile(profile CodexFingerprintProfile) CodexFingerprintProfile {
+	profile.HTTPHeaderNames = append([]string(nil), profile.HTTPHeaderNames...)
+	profile.WebsocketHeaderNames = append([]string(nil), profile.WebsocketHeaderNames...)
+	return profile
 }
 
 func compareCodexReleaseVersions(left, right string) (int, error) {

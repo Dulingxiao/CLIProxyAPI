@@ -218,11 +218,19 @@ routing:
 
 # Codex provider behavior.
 codex:
+  # TLS A-B profile for official ChatGPT endpoints: chrome | safari-like | go-standard.
+  tls-profile: "chrome"
+  # Reuse connections and TLS sessions only within the same (Auth, proxy) scope.
+  tls-reuse-connections: true
   # When true, and routing.strategy is fill-first or routing.session-affinity is true,
   # remap Codex prompt_cache_key and installation identity per selected auth.
   # Some superstitious users believe request tracking identifiers can be used
   # as evidence for TOS enforcement bans; this option only satisfies those odd concerns.
   identity-confuse: false
+  # OAuth application-identity convergence is opt-in. Values: off, device, session, full.
+  # Keep off for normal client identity passthrough. Per-auth codex_fingerprint_mode
+  # and openai_device_id attributes override the global mode and derived device ID.
+  fingerprint-mode: off
   # Disable forcing the official Codex User-Agent and Originator headers on HTTP/SSE and WebSocket requests.
   disable-codex-cloaking: false
   # Disable startup and hourly synchronization of the Codex application fingerprint
@@ -259,6 +267,44 @@ codex:
     #       - "turn:turn.example.com:3478?transport=udp"
     #     username: "user"
     #     credential: "secret"
+  # Collect Codex quota percentages from response headers and active usage queries.
+  quota:
+    enabled: true
+    stale-after: "10m"
+    # Faster polling near the overdraft threshold.
+    near-threshold-stale-after: "60s"
+    # Per-auth lower bound for active /wham/usage queries.
+    min-active-interval: "60s"
+    startup-jitter: "30s"
+    active-query-concurrency: 8
+  # Enable the FIFO overdraft pool and final-request zz injection.
+  # This requires codex.quota.enabled and accounting.enabled.
+  overdraft:
+    enabled: false
+    quota-threshold-percent: "98"
+    # Begin accelerated active quota polling before entering the candidate queue.
+    arm-threshold-percent: "90"
+    # Global overdraft-overlay ceiling, not an ordinary per-auth concurrency limit.
+    max-in-flight: 40
+    # Per-auth business ceiling; 0 inherits max-in-flight. Auth attribute
+    # codex_overdraft_max_in_flight takes precedence when valid.
+    per-auth-max-in-flight: 0
+    # Only the current drain owner's structured usage-limit cooldown may be bypassed.
+    late-admission-bypass-cooldown: true
+    late-admission-max-attempts: 3
+    # Explicit opt-in; false keeps full windows with paid credits out of scheduling.
+    allow-credit-spend: false
+    # Consecutive typed usage-limit 429s on overdraft business traffic mark EXHAUSTED.
+    exhaustion-probe-failures: 10
+    probe-min-interval: "1s"
+    probe-model: ""
+
+# Persist immutable per-auth request usage and asynchronous price results.
+accounting:
+  enabled: false
+  # Attempt intents and terminal usage are synchronous; only pricing is asynchronous.
+  # AUTH_STATE_DIR resolves to the directory containing file-based auth state.
+  storage-path: "AUTH_STATE_DIR/accounting.db"
 
 # Antigravity provider behavior.
 # antigravity:

@@ -1724,6 +1724,7 @@ func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
 	req = req.WithContext(contextWithGinHeaders(map[string]string{
 		"Originator":            "Codex Desktop",
 		"Version":               "0.115.0-alpha.27",
+		"X-Codex-Turn-State":    "turn-state-1",
 		"X-Codex-Turn-Metadata": `{"turn_id":"turn-1"}`,
 		"X-Client-Request-Id":   "019d2233-e240-7162-992d-38df0a2a0e0d",
 	}))
@@ -1737,11 +1738,27 @@ func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
 	if got := req.Header.Get("Version"); got != "0.115.0-alpha.27" {
 		t.Fatalf("Version = %s, want %s", got, "0.115.0-alpha.27")
 	}
+	if got := req.Header.Get("X-Codex-Turn-State"); got != "turn-state-1" {
+		t.Fatalf("X-Codex-Turn-State = %s, want turn-state-1", got)
+	}
 	if got := req.Header.Get("X-Codex-Turn-Metadata"); got != `{"turn_id":"turn-1"}` {
 		t.Fatalf("X-Codex-Turn-Metadata = %s, want %s", got, `{"turn_id":"turn-1"}`)
 	}
 	if got := req.Header.Get("X-Client-Request-Id"); got != "019d2233-e240-7162-992d-38df0a2a0e0d" {
 		t.Fatalf("X-Client-Request-Id = %s, want %s", got, "019d2233-e240-7162-992d-38df0a2a0e0d")
+	}
+}
+
+func TestApplyCodexTurnStateClearRemovesTransportHeader(t *testing.T) {
+	headers := http.Header{"X-Codex-Turn-State": []string{"foreign-state"}}
+	opts := cliproxyexecutor.Options{Metadata: map[string]any{
+		cliproxyexecutor.CodexTurnStateClearMetadataKey: true,
+	}}
+
+	applyCodexTurnStateClear(headers, opts)
+
+	if got := headers.Get("X-Codex-Turn-State"); got != "" {
+		t.Fatalf("X-Codex-Turn-State = %q, want empty", got)
 	}
 }
 
@@ -1802,6 +1819,14 @@ func TestNewCodexWebsocketDialerUsesUTLSOnlyForOfficialOAuth(t *testing.T) {
 	}
 	if official.Proxy != nil {
 		t.Fatal("official OAuth websocket proxy must be handled before the uTLS handshake")
+	}
+	standard := newCodexWebsocketDialer(
+		&config.Config{Codex: config.CodexConfig{TLSProfile: config.CodexTLSProfileGoStandard}},
+		&cliproxyauth.Auth{ID: "oauth-standard", Provider: "codex"},
+		"wss://chatgpt.com/backend-api/codex/responses",
+	)
+	if standard.NetDialTLSContext != nil {
+		t.Fatal("go-standard websocket profile unexpectedly installed uTLS")
 	}
 
 	for _, tc := range []struct {

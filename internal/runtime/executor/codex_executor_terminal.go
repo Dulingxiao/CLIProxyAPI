@@ -289,6 +289,10 @@ func newCodexStatusErr(statusCode int, body []byte) statusErr {
 	}
 	body = classifyCodexStatusError(errCode, body)
 	err := statusErr{code: errCode, msg: string(body)}
+	err.providerCode = strings.TrimSpace(gjson.GetBytes(body, "error.type").String())
+	if err.providerCode == "" {
+		err.providerCode = strings.TrimSpace(gjson.GetBytes(body, "error.code").String())
+	}
 	if retryAfter := parseCodexRetryAfter(errCode, body, time.Now()); retryAfter != nil {
 		err.retryAfter = retryAfter
 	}

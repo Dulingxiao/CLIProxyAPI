@@ -14,6 +14,22 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
+type failingDurableUsageSink struct{}
+
+func (*failingDurableUsageSink) HandleUsage(context.Context, usage.Record) {}
+func (*failingDurableUsageSink) HandleUsageDurable(context.Context, usage.Record) error {
+	return errors.New("injected durable usage failure")
+}
+
+func TestUsageReporterReturnsDurableSinkError(t *testing.T) {
+	usage.DefaultManager().SetBuiltinSink(&failingDurableUsageSink{})
+	defer usage.DefaultManager().SetBuiltinSink(nil)
+	reporter := NewUsageReporter(context.Background(), "codex", "gpt-test", nil)
+	if errPublish := reporter.Publish(context.Background(), usage.Detail{}); errPublish == nil || errPublish.Error() != "injected durable usage failure" {
+		t.Fatalf("Publish() error = %v", errPublish)
+	}
+}
+
 func TestParseOpenAIUsageChatCompletions(t *testing.T) {
 	data := []byte(`{"usage":{"prompt_tokens":10,"completion_tokens":6,"total_tokens":16,"prompt_tokens_details":{"cached_tokens":4},"completion_tokens_details":{"reasoning_tokens":5}}}`)
 	detail := ParseOpenAIUsage(data)
@@ -576,6 +592,20 @@ func TestUsageReporterBuildRecordIncludesRequestedModelAlias(t *testing.T) {
 	}
 	if record.Alias != "client-gpt" {
 		t.Fatalf("alias = %q, want %q", record.Alias, "client-gpt")
+	}
+}
+
+type usageNotDispatchedError struct{}
+
+func (usageNotDispatchedError) Error() string       { return "not dispatched" }
+func (usageNotDispatchedError) NotDispatched() bool { return true }
+
+func TestUsageReporterMarksNotDispatchedFailure(t *testing.T) {
+	reporter := NewUsageReporter(context.Background(), "codex", "gpt-test", nil)
+	reporter.PublishFailure(context.Background(), usageNotDispatchedError{})
+	record := reporter.buildRecord(usage.Detail{}, true)
+	if record.FailureClass != "not_dispatched" {
+		t.Fatalf("failure class = %q", record.FailureClass)
 	}
 }
 

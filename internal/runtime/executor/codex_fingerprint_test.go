@@ -3,7 +3,11 @@ package executor
 import (
 	"encoding/json"
 	"net/http"
+	"os"
+	"reflect"
+	"sort"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -13,8 +17,171 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestCodexFingerprintConvergenceIsOptIn(t *testing.T) {
+	auth := &cliproxyauth.Auth{ID: "oauth-default-off", Metadata: map[string]any{"access_token": "oauth-token"}}
+	input := []byte(`{"prompt_cache_key":"client-session","client_metadata":{"session_id":"client-session","thread_id":"client-thread"}}`)
+	got, identity := applyCodexOfficialApplicationIdentity(&config.Config{}, auth, "https://chatgpt.com/backend-api/codex/responses", input)
+	if !identity.enabled || identity.mode != codexFingerprintOff {
+		t.Fatalf("official gating identity = %+v", identity)
+	}
+	if string(got) != string(input) {
+		t.Fatalf("default-off request changed: %s", got)
+	}
+}
+
+func TestCodexOfficialGatingHeadersRemainEnabledForOffModes(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		cfg  *config.Config
+	}{
+		{name: "default off", cfg: &config.Config{}},
+		{name: "explicit off", cfg: &config.Config{Codex: config.CodexConfig{FingerprintMode: "off"}}},
+		{name: "legacy cloaking disabled", cfg: &config.Config{Codex: config.CodexConfig{FingerprintMode: "full", DisableCodexCloaking: true}}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			body := []byte(`{"model":"gpt-5.5","input":"hello"}`)
+			got, identity := applyCodexOfficialApplicationIdentity(testCase.cfg, &cliproxyauth.Auth{ID: "oauth-gating", Metadata: map[string]any{"access_token": "oauth-token"}}, "https://chatgpt.com/backend-api/codex/responses", body)
+			if string(got) != string(body) || !identity.enabled || identity.mode != codexFingerprintOff {
+				t.Fatalf("identity = %#v body = %s", identity, got)
+			}
+			headers := make(http.Header)
+			applyCodexOfficialApplicationIdentityHeaders(headers, &identity)
+			profile := registry.GetCodexFingerprintProfile()
+			if !strings.HasPrefix(headers.Get("User-Agent"), "codex_cli_rs/") || headers.Get("Originator") != "codex_cli_rs" || headers.Get("Version") != profile.Version {
+				t.Fatalf("gating headers = %#v", headers)
+			}
+			if headers.Get(profile.Headers.InstallationID) != "" || headers.Get(profile.Headers.TurnMetadata) != "" {
+				t.Fatalf("off mode emitted convergence headers: %#v", headers)
+			}
+		})
+	}
+}
+
+func TestCodexOfficialIdentityHeadersMatchGoldenContract(t *testing.T) {
+	data, errRead := os.ReadFile("testdata/codex_official_identity_headers.json")
+	if errRead != nil {
+		t.Fatal(errRead)
+	}
+	var golden struct {
+		SourceRevision string   `json:"source_revision"`
+		HTTP           []string `json:"http"`
+		Websocket      []string `json:"websocket"`
+	}
+	if errJSON := json.Unmarshal(data, &golden); errJSON != nil {
+		t.Fatal(errJSON)
+	}
+	profile := registry.GetCodexFingerprintProfile()
+	if golden.SourceRevision != profile.SourceRevision {
+		t.Fatalf("golden source revision = %q, profile = %q", golden.SourceRevision, profile.SourceRevision)
+	}
+	auth := &cliproxyauth.Auth{ID: "oauth-golden", Metadata: map[string]any{"access_token": "oauth-token"}}
+	body := []byte(`{"client_metadata":{"x-openai-subagent":"review"}}`)
+	for _, test := range []struct {
+		name string
+		url  string
+		want []string
+	}{
+		{name: "http", url: "https://chatgpt.com/backend-api/codex/responses", want: golden.HTTP},
+		{name: "websocket", url: "wss://chatgpt.com/backend-api/codex/responses", want: golden.Websocket},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, identity := applyCodexOfficialApplicationIdentity(&config.Config{Codex: config.CodexConfig{FingerprintMode: "full"}}, auth, test.url, body)
+			headers := make(http.Header)
+			applyCodexOfficialApplicationIdentityHeaders(headers, &identity)
+			got := make([]string, 0, len(headers))
+			for key := range headers {
+				got = append(got, strings.ToLower(key))
+			}
+			sort.Strings(got)
+			if !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("header contract diff: got %#v want %#v", got, test.want)
+			}
+		})
+	}
+}
+
+func sessionFingerprintConfig() *config.Config {
+	return &config.Config{Codex: config.CodexConfig{FingerprintMode: "session"}}
+}
+
+func TestCodexFingerprintModesMatchOptInConvergenceStrength(t *testing.T) {
+	auth := &cliproxyauth.Auth{ID: "oauth-modes", Metadata: map[string]any{"access_token": "oauth-token"}}
+	requestURL := "https://chatgpt.com/backend-api/codex/responses"
+	bodyA := []byte(`{"prompt_cache_key":"client-a","client_metadata":{"x-codex-installation-id":"install-a","session_id":"session-a","thread_id":"thread-a"}}`)
+	bodyB := []byte(`{"prompt_cache_key":"client-b","client_metadata":{"x-codex-installation-id":"install-b","session_id":"session-b","thread_id":"thread-b"}}`)
+
+	deviceBody, device := applyCodexOfficialApplicationIdentity(&config.Config{Codex: config.CodexConfig{FingerprintMode: "device"}}, auth, requestURL, bodyA)
+	if !device.enabled || device.mode != codexFingerprintDevice {
+		t.Fatalf("device identity = %+v", device)
+	}
+	if got := gjson.GetBytes(deviceBody, "client_metadata.session_id").String(); got != "session-a" {
+		t.Fatalf("device mode session_id = %q, want passthrough", got)
+	}
+	if got := gjson.GetBytes(deviceBody, "client_metadata.thread_id").String(); got != "thread-a" {
+		t.Fatalf("device mode thread_id = %q, want passthrough", got)
+	}
+	if got := gjson.GetBytes(deviceBody, "client_metadata.x-codex-installation-id").String(); got == "" || got == "install-a" {
+		t.Fatalf("device mode installation_id = %q, want converged value", got)
+	}
+
+	sessionCfg := &config.Config{Codex: config.CodexConfig{FingerprintMode: "session"}}
+	headersA := http.Header{"Session-Id": []string{"client-a"}}
+	headersB := http.Header{"Session-Id": []string{"client-b"}}
+	_, sessionA := applyCodexOfficialApplicationIdentity(sessionCfg, auth, requestURL, bodyA, headersA)
+	_, sessionB := applyCodexOfficialApplicationIdentity(sessionCfg, auth, requestURL, bodyB, headersB)
+	if sessionA.installationID != sessionB.installationID || sessionA.sessionID != sessionB.sessionID {
+		t.Fatalf("session mode account identity diverged: A=%+v B=%+v", sessionA, sessionB)
+	}
+	if sessionA.threadID == sessionB.threadID {
+		t.Fatalf("session mode collapsed distinct client sessions to one thread: %q", sessionA.threadID)
+	}
+	if sessionA.windowID != sessionA.threadID+":0" || sessionB.windowID != sessionB.threadID+":0" {
+		t.Fatalf("session mode window IDs = %q, %q", sessionA.windowID, sessionB.windowID)
+	}
+
+	fullCfg := &config.Config{Codex: config.CodexConfig{FingerprintMode: "full"}}
+	_, fullA := applyCodexOfficialApplicationIdentity(fullCfg, auth, requestURL, bodyA)
+	_, fullB := applyCodexOfficialApplicationIdentity(fullCfg, auth, requestURL, bodyB)
+	if fullA.installationID != fullB.installationID || fullA.sessionID != fullB.sessionID || fullA.threadID != fullB.threadID {
+		t.Fatalf("full mode did not converge account identity: A=%+v B=%+v", fullA, fullB)
+	}
+}
+
+func TestCodexFingerprintPerAuthModeOverridesGlobalMode(t *testing.T) {
+	auth := &cliproxyauth.Auth{
+		ID:         "oauth-override",
+		Attributes: map[string]string{"codex_fingerprint_mode": "off"},
+		Metadata:   map[string]any{"access_token": "oauth-token"},
+	}
+	input := []byte(`{"prompt_cache_key":"client-session"}`)
+	got, identity := applyCodexOfficialApplicationIdentity(&config.Config{Codex: config.CodexConfig{FingerprintMode: "full"}}, auth, "https://chatgpt.com/backend-api/codex/responses", input)
+	if !identity.enabled || identity.mode != codexFingerprintOff || string(got) != string(input) {
+		t.Fatalf("per-auth off override identity=%+v body=%s", identity, got)
+	}
+}
+
+func TestCodexFingerprintUsesPerAuthDeviceID(t *testing.T) {
+	auth := &cliproxyauth.Auth{
+		ID:         "oauth-device-id",
+		Attributes: map[string]string{"openai_device_id": "configured-device-id"},
+		Metadata:   map[string]any{"access_token": "oauth-token"},
+	}
+	body, identity := applyCodexOfficialApplicationIdentity(
+		&config.Config{Codex: config.CodexConfig{FingerprintMode: "device"}},
+		auth,
+		"https://chatgpt.com/backend-api/codex/responses",
+		[]byte(`{"client_metadata":{"x-codex-installation-id":"client-device"}}`),
+	)
+	if identity.installationID != "configured-device-id" {
+		t.Fatalf("installation ID = %q, want configured-device-id", identity.installationID)
+	}
+	if got := gjson.GetBytes(body, "client_metadata.x-codex-installation-id").String(); got != "configured-device-id" {
+		t.Fatalf("body installation ID = %q, want configured-device-id", got)
+	}
+}
+
 func TestCodexApplicationIdentityProjectsCanonicalMetadata(t *testing.T) {
-	cfg := &config.Config{}
+	cfg := sessionFingerprintConfig()
 	auth := &cliproxyauth.Auth{
 		ID:       "oauth-account-a",
 		Metadata: map[string]any{"access_token": "oauth-token"},
@@ -34,10 +201,18 @@ func TestCodexApplicationIdentityProjectsCanonicalMetadata(t *testing.T) {
 	if !first.enabled {
 		t.Fatal("application identity is disabled for official OAuth request")
 	}
-	assertUUIDVersion(t, first.windowID, 7)
 	assertUUIDVersion(t, first.turnID, 7)
+	if first.windowID != first.threadID+":0" {
+		t.Fatalf("window ID = %q, want thread-scoped window", first.windowID)
+	}
 	if _, err := uuid.Parse(first.installationID); err != nil {
 		t.Fatalf("installation ID %q is not a UUID: %v", first.installationID, err)
+	}
+	for name, value := range map[string]string{"installation": first.installationID, "session": first.sessionID, "thread": first.threadID} {
+		parsed, errParse := uuid.Parse(value)
+		if errParse != nil || parsed.Version() != 4 {
+			t.Fatalf("%s ID = %q, want UUIDv4 (err=%v)", name, value, errParse)
+		}
 	}
 	if got := gjson.GetBytes(firstBody, "client_metadata.custom-key").String(); got != "preserved" {
 		t.Fatalf("custom client metadata = %q, want preserved", got)
@@ -92,8 +267,8 @@ func TestCodexApplicationIdentityProjectsCanonicalMetadata(t *testing.T) {
 	if got := headers.Get(profile.Headers.TurnMetadata); got != turnMetadataRaw {
 		t.Fatalf("turn metadata header differs from client_metadata: %q != %q", got, turnMetadataRaw)
 	}
-	if got := headers.Get(profile.Headers.ParentThreadID); got != "parent-thread-a" {
-		t.Fatalf("parent thread header = %q", got)
+	if got := headers.Get(profile.Headers.ParentThreadID); got != "" {
+		t.Fatalf("uncertain parent thread header = %q, want omitted", got)
 	}
 	if got := headers.Get(profile.Headers.Subagent); got != "collab_spawn" {
 		t.Fatalf("subagent header = %q", got)
@@ -115,7 +290,7 @@ func TestCodexApplicationIdentityProjectsCanonicalParentMetadata(t *testing.T) {
 	profile := registry.GetCodexFingerprintProfile()
 	rawMetadata := `{"parent_thread_id":"parent-thread-b","parent_turn_id":"parent-turn-b","subagent_kind":"review"}`
 	body, identity := applyCodexOfficialApplicationIdentity(
-		&config.Config{},
+		sessionFingerprintConfig(),
 		&cliproxyauth.Auth{ID: "oauth-parent-projection", Metadata: map[string]any{"access_token": "oauth-token"}},
 		"https://chatgpt.com/backend-api/codex/responses",
 		[]byte(`{"prompt_cache_key":"parent-session","client_metadata":{"`+profile.Headers.TurnMetadata+`":`+strconv.Quote(rawMetadata)+`}}`),
@@ -135,7 +310,7 @@ func TestCodexApplicationIdentityProjectsCanonicalParentMetadata(t *testing.T) {
 }
 
 func TestCodexApplicationIdentityMarksCompaction(t *testing.T) {
-	cfg := &config.Config{}
+	cfg := sessionFingerprintConfig()
 	auth := &cliproxyauth.Auth{ID: "oauth-compact", Metadata: map[string]any{"access_token": "oauth-token"}}
 	body, identity := applyCodexOfficialApplicationIdentity(
 		cfg,
@@ -153,13 +328,72 @@ func TestCodexApplicationIdentityMarksCompaction(t *testing.T) {
 	}
 	headers := http.Header{}
 	applyCodexOfficialApplicationIdentityHeaders(headers, &identity)
-	if got := headers.Get(profile.Headers.InstallationID); got != identity.installationID {
-		t.Fatalf("compact installation header = %q, want %q", got, identity.installationID)
+	if got := headers.Get(profile.Headers.InstallationID); got != "" {
+		t.Fatalf("compact installation header = %q, want omitted by source-derived contract", got)
+	}
+}
+
+func TestCodexOfficialIdentityPassesThroughGovernedHeadersAndDualIDs(t *testing.T) {
+	auth := &cliproxyauth.Auth{ID: "oauth-governed", Metadata: map[string]any{"access_token": "oauth-token"}}
+	inbound := http.Header{
+		"X-Oai-Attestation":                 {"signed-attestation"},
+		"X-Openai-Internal-Codex-Residency": {"us"},
+	}
+	_, identity := applyCodexOfficialApplicationIdentity(
+		sessionFingerprintConfig(), auth, "https://chatgpt.com/backend-api/codex/responses", []byte(`{"input":"hello"}`), inbound,
+	)
+	headers := make(http.Header)
+	applyCodexOfficialApplicationIdentityHeaders(headers, &identity)
+	if got := headers.Get("X-Oai-Attestation"); got != "signed-attestation" {
+		t.Fatalf("attestation = %q", got)
+	}
+	if got := headers.Get("X-Openai-Internal-Codex-Residency"); got != "us" {
+		t.Fatalf("residency = %q", got)
+	}
+	for _, key := range []string{"session_id", "session-id", "thread_id", "thread-id"} {
+		if values := headers[key]; len(values) != 1 || values[0] == "" {
+			t.Fatalf("dual identity header %q = %#v", key, values)
+		}
+	}
+	if headers["session_id"][0] != headers["session-id"][0] || headers["thread_id"][0] != headers["thread-id"][0] {
+		t.Fatalf("dual identity values diverged: %#v", headers)
+	}
+}
+
+func TestCodexOfficialIdentityDoesNotSynthesizeGovernedHeaders(t *testing.T) {
+	auth := &cliproxyauth.Auth{ID: "oauth-no-governed", Metadata: map[string]any{"access_token": "oauth-token"}}
+	_, identity := applyCodexOfficialApplicationIdentity(sessionFingerprintConfig(), auth, "https://chatgpt.com/backend-api/codex/responses", []byte(`{"input":"hello"}`))
+	headers := make(http.Header)
+	applyCodexOfficialApplicationIdentityHeaders(headers, &identity)
+	if headers.Get("X-Oai-Attestation") != "" || headers.Get("X-Openai-Internal-Codex-Residency") != "" {
+		t.Fatalf("governed headers were synthesized: %#v", headers)
+	}
+}
+
+func TestCodexUserAgentAuthOverrideRequiresOfficialPrefix(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		ua   string
+		want string
+	}{
+		{name: "valid", ua: "codex_cli_rs/0.200.0 (Mac OS 26.6; arm64)", want: "codex_cli_rs/0.200.0 (Mac OS 26.6; arm64)"},
+		{name: "invalid prefix", ua: "browser/1.0", want: registry.GetCodexFingerprintProfile().UserAgent()},
+		{name: "invalid value", ua: "codex_cli_rs/0.200.0\r\nInjected: yes", want: registry.GetCodexFingerprintProfile().UserAgent()},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			auth := &cliproxyauth.Auth{ID: "oauth-ua", Attributes: map[string]string{"codex_user_agent": test.ua}, Metadata: map[string]any{"access_token": "oauth-token"}}
+			_, identity := applyCodexOfficialApplicationIdentity(&config.Config{}, auth, "https://chatgpt.com/backend-api/codex/responses", []byte(`{"input":"hello"}`))
+			headers := make(http.Header)
+			applyCodexOfficialApplicationIdentityHeaders(headers, &identity)
+			if got := headers.Get("User-Agent"); got != test.want {
+				t.Fatalf("User-Agent = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 
 func TestApplyCodexOfficialFingerprintHeadersUsesProfile(t *testing.T) {
-	cfg := &config.Config{}
+	cfg := sessionFingerprintConfig()
 	auth := &cliproxyauth.Auth{ID: "oauth-software-profile", Metadata: map[string]any{"access_token": "oauth-token"}}
 	_, identity := applyCodexOfficialApplicationIdentity(
 		cfg,
@@ -187,7 +421,7 @@ func TestApplyCodexOfficialFingerprintHeadersUsesProfile(t *testing.T) {
 }
 
 func TestApplyCodexWebsocketFingerprintUsesProfile(t *testing.T) {
-	cfg := &config.Config{}
+	cfg := sessionFingerprintConfig()
 	auth := &cliproxyauth.Auth{ID: "oauth-ws-profile", Metadata: map[string]any{"access_token": "oauth-token"}}
 	_, identity := applyCodexOfficialApplicationIdentity(
 		cfg,
@@ -219,25 +453,19 @@ func TestCodexOfficialFingerprintScopeBypassesExcludedRequests(t *testing.T) {
 	}{
 		{
 			name:       "api key",
-			cfg:        &config.Config{},
+			cfg:        sessionFingerprintConfig(),
 			auth:       &cliproxyauth.Auth{ID: "api-key", Attributes: map[string]string{"api_key": "sk-test"}},
 			requestURL: "https://chatgpt.com/backend-api/codex/responses",
 		},
 		{
 			name:       "custom auth base URL",
-			cfg:        &config.Config{},
+			cfg:        sessionFingerprintConfig(),
 			auth:       &cliproxyauth.Auth{ID: "custom", Attributes: map[string]string{"base_url": "https://gateway.example.com"}},
 			requestURL: "https://gateway.example.com/responses",
 		},
 		{
-			name:       "cloaking disabled",
-			cfg:        &config.Config{Codex: config.CodexConfig{DisableCodexCloaking: true}},
-			auth:       &cliproxyauth.Auth{ID: "oauth", Metadata: map[string]any{"access_token": "oauth-token"}},
-			requestURL: "https://chatgpt.com/backend-api/codex/responses",
-		},
-		{
 			name:       "custom target",
-			cfg:        &config.Config{},
+			cfg:        sessionFingerprintConfig(),
 			auth:       &cliproxyauth.Auth{ID: "oauth", Metadata: map[string]any{"access_token": "oauth-token"}},
 			requestURL: "https://gateway.example.com/responses",
 		},

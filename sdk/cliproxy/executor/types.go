@@ -2,8 +2,10 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/url"
+	"time"
 
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 )
@@ -30,6 +32,143 @@ const ServiceTierMetadataKey = "service_tier"
 // GenerateMetadataKey stores whether the client requested actual generation for usage logs.
 // Missing or true means generation is enabled; only an explicit false disables generation.
 const GenerateMetadataKey = "generate"
+
+// CodexOverdraftExecutionMetadataKey carries an opaque, request-scoped send lease.
+const CodexOverdraftExecutionMetadataKey = "codex_overdraft_execution"
+
+// CodexQuotaObserverMetadataKey carries a callback for allowlisted quota observations.
+const CodexQuotaObserverMetadataKey = "codex_quota_observer"
+
+// AccountingAttemptMetadataKey carries durable intent hooks for one upstream attempt.
+const AccountingAttemptMetadataKey = "accounting_attempt"
+
+// CodexTurnStateClearMetadataKey instructs Codex transports to remove client turn state.
+const CodexTurnStateClearMetadataKey = "codex_turn_state_clear"
+
+// CodexTurnStateClearFromOptions reports whether transport-level turn state must be removed.
+func CodexTurnStateClearFromOptions(opts Options) bool {
+	if len(opts.Metadata) == 0 {
+		return false
+	}
+	clear, _ := opts.Metadata[CodexTurnStateClearMetadataKey].(bool)
+	return clear
+}
+
+// AccountingAttemptHooks persist an immutable intent before network dispatch.
+type AccountingAttemptHooks struct {
+	RecordIntent        func() error
+	RecordRetryIntent   func() error
+	RecordNotDispatched func()
+	CurrentAttemptID    func() string
+}
+
+// AccountingAttemptHooksFromOptions extracts accounting hooks.
+func AccountingAttemptHooksFromOptions(opts Options) *AccountingAttemptHooks {
+	if len(opts.Metadata) == 0 {
+		return nil
+	}
+	hooks, _ := opts.Metadata[AccountingAttemptMetadataKey].(*AccountingAttemptHooks)
+	return hooks
+}
+
+// CodexQuotaHeadersObservation carries only allowlisted quota response headers.
+type CodexQuotaHeadersObservation struct {
+	AuthID         string
+	AuthGeneration uint64
+	AttemptID      string
+	ObservedAt     time.Time
+	Header         http.Header
+}
+
+// CodexQuotaObserver receives one response-header quota observation.
+type CodexQuotaObserver func(CodexQuotaHeadersObservation)
+
+// CodexOverdraftKind identifies the work admitted by an overdraft lease.
+type CodexOverdraftKind string
+
+const (
+	// CodexOverdraftBusiness marks client business traffic.
+	CodexOverdraftBusiness CodexOverdraftKind = "business"
+	// CodexOverdraftProbe marks dedicated exhaustion probes.
+	CodexOverdraftProbe CodexOverdraftKind = "exhaustion_probe"
+)
+
+// CodexOverdraftExecution exposes only the executor hooks needed at the send boundary.
+type CodexOverdraftExecution struct {
+	AuthID               string
+	AuthGeneration       uint64
+	DrainCycleID         string
+	CoordinatorEpoch     uint64
+	AuthStateEpoch       uint64
+	DispatchID           string
+	Kind                 CodexOverdraftKind
+	beginSend            func() error
+	release              func()
+	businessUsageLimited func() error
+	businessCompleted    func() error
+}
+
+// NewCodexOverdraftExecution constructs an opaque execution lease.
+func NewCodexOverdraftExecution(authID string, authGeneration uint64, drainCycleID string, coordinatorEpoch, authStateEpoch uint64, dispatchID string, kind CodexOverdraftKind, beginSend func() error, release func(), businessUsageLimited func() error) *CodexOverdraftExecution {
+	return NewCodexOverdraftExecutionWithCompletion(authID, authGeneration, drainCycleID, coordinatorEpoch, authStateEpoch, dispatchID, kind, beginSend, release, businessUsageLimited, nil)
+}
+
+// NewCodexOverdraftExecutionWithCompletion constructs a lease that can reset the usage-limit streak.
+func NewCodexOverdraftExecutionWithCompletion(authID string, authGeneration uint64, drainCycleID string, coordinatorEpoch, authStateEpoch uint64, dispatchID string, kind CodexOverdraftKind, beginSend func() error, release func(), businessUsageLimited, businessCompleted func() error) *CodexOverdraftExecution {
+	return &CodexOverdraftExecution{
+		AuthID:               authID,
+		AuthGeneration:       authGeneration,
+		DrainCycleID:         drainCycleID,
+		CoordinatorEpoch:     coordinatorEpoch,
+		AuthStateEpoch:       authStateEpoch,
+		DispatchID:           dispatchID,
+		Kind:                 kind,
+		beginSend:            beginSend,
+		release:              release,
+		businessUsageLimited: businessUsageLimited,
+		businessCompleted:    businessCompleted,
+	}
+}
+
+// BeginSend atomically rechecks the send fence for every actual upstream write.
+func (e *CodexOverdraftExecution) BeginSend() error {
+	if e == nil || e.beginSend == nil {
+		return nil
+	}
+	return e.beginSend()
+}
+
+// Release returns the admission permit. The supplied hook is idempotent.
+func (e *CodexOverdraftExecution) Release() {
+	if e != nil && e.release != nil {
+		e.release()
+	}
+}
+
+// BusinessUsageLimited records one typed usage-limit 429 for the active owner.
+func (e *CodexOverdraftExecution) BusinessUsageLimited() error {
+	if e == nil || e.businessUsageLimited == nil {
+		return nil
+	}
+	return e.businessUsageLimited()
+}
+
+// BusinessCompleted clears the consecutive usage-limit streak after a non-limit result.
+func (e *CodexOverdraftExecution) BusinessCompleted() error {
+	if e == nil || e.businessCompleted == nil {
+		return nil
+	}
+	return e.businessCompleted()
+}
+
+// CodexOverdraftExecutionFromOptions extracts an opaque lease from request options.
+func CodexOverdraftExecutionFromOptions(opts Options) *CodexOverdraftExecution {
+	if len(opts.Metadata) == 0 {
+		return nil
+	}
+	execution, _ := opts.Metadata[CodexOverdraftExecutionMetadataKey].(*CodexOverdraftExecution)
+	return execution
+}
 
 const (
 	// PinnedAuthMetadataKey locks execution to a specific auth ID.
@@ -138,6 +277,43 @@ func (e *RequestTerminatedError) ResponseBody() []byte {
 	return append([]byte(nil), e.Body...)
 }
 
+// UpstreamNotDispatchedError marks a failure before an upstream write started.
+type UpstreamNotDispatchedError struct {
+	cause error
+}
+
+// NewUpstreamNotDispatchedError wraps a pre-send failure for retry accounting.
+func NewUpstreamNotDispatchedError(cause error) error {
+	if cause == nil {
+		return nil
+	}
+	return &UpstreamNotDispatchedError{cause: cause}
+}
+
+func (e *UpstreamNotDispatchedError) Error() string {
+	if e == nil || e.cause == nil {
+		return "upstream request not dispatched"
+	}
+	return "upstream request not dispatched: " + e.cause.Error()
+}
+
+// Unwrap exposes the pre-send cause.
+func (e *UpstreamNotDispatchedError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+// NotDispatched reports that no upstream attempt budget was consumed.
+func (e *UpstreamNotDispatchedError) NotDispatched() bool { return e != nil }
+
+// IsUpstreamNotDispatched identifies pre-send failures through wrapping.
+func IsUpstreamNotDispatched(err error) bool {
+	var notDispatched interface{ NotDispatched() bool }
+	return errors.As(err, &notDispatched) && notDispatched.NotDispatched()
+}
+
 // Options controls execution behavior for both streaming and non-streaming calls.
 type Options struct {
 	// Stream toggles streaming mode.
@@ -213,3 +389,35 @@ type RequestScopedError interface {
 	error
 	IsRequestScoped() bool
 }
+
+// UsagePersistenceError reports a post-dispatch terminal accounting failure.
+// It is request-scoped so auth managers do not duplicate completed upstream work.
+type UsagePersistenceError struct {
+	cause error
+}
+
+// NewUsagePersistenceError wraps a durable terminal usage failure.
+func NewUsagePersistenceError(cause error) error {
+	if cause == nil {
+		return nil
+	}
+	return &UsagePersistenceError{cause: cause}
+}
+
+func (e *UsagePersistenceError) Error() string {
+	return "durable usage accounting failed"
+}
+
+// Unwrap exposes the storage cause to internal diagnostics.
+func (e *UsagePersistenceError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+// IsRequestScoped prevents cross-credential replay after upstream completion.
+func (e *UsagePersistenceError) IsRequestScoped() bool { return e != nil }
+
+// StatusCode maps the accounting outage to service unavailable.
+func (e *UsagePersistenceError) StatusCode() int { return http.StatusServiceUnavailable }

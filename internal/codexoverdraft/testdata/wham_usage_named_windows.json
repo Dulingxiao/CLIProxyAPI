@@ -1,0 +1,11 @@
+{
+  "plan_type": "team",
+  "rate_limit": {
+    "allowed": false,
+    "limit_reached": true,
+    "rate_limit_reached_type": "weekly",
+    "credits": {"has_credits": true, "unlimited": true, "balance": "unlimited"},
+    "five_hour": {"used_percent": 100, "limit_window_seconds": 18000, "reset_at": 1786928400},
+    "weekly": {"used_percent": 82.25, "limit_window_seconds": 604800, "reset_at": 1787443200}
+  }
+}

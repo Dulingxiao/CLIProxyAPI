@@ -132,16 +132,35 @@ type AntigravityConfig struct {
 }
 
 // CodexConfig configures provider-wide Codex request behavior.
+const DefaultCodexFingerprintMode = "off"
+
+const (
+	DefaultCodexTLSProfile    = "chrome"
+	CodexTLSProfileChrome     = "chrome"
+	CodexTLSProfileSafariLike = "safari-like"
+	CodexTLSProfileGoStandard = "go-standard"
+)
+
 type CodexConfig struct {
 	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
+	// FingerprintMode controls explicit OAuth application-identity convergence: off, device, session, or full.
+	FingerprintMode string `yaml:"fingerprint-mode" json:"fingerprint-mode"`
 	// DisableCodexCloaking disables forcing the official Codex identity headers on HTTP/SSE and WebSocket requests.
 	DisableCodexCloaking bool `yaml:"disable-codex-cloaking" json:"disable-codex-cloaking"`
 	// DisableFingerprintAutoSync disables refreshing the Codex application profile from official sources.
 	DisableFingerprintAutoSync bool `yaml:"disable-fingerprint-auto-sync" json:"disable-fingerprint-auto-sync"`
+	// TLSProfile selects the ChatGPT transport profile: chrome, safari-like, or go-standard.
+	TLSProfile string `yaml:"tls-profile" json:"tls-profile"`
+	// TLSReuseConnections scopes connection pooling and TLS resumption to one auth and proxy.
+	TLSReuseConnections bool `yaml:"tls-reuse-connections" json:"tls-reuse-connections"`
 	// OptimizeMultiAgentV2 optimizes official Codex multi-agent requests.
 	OptimizeMultiAgentV2 bool `yaml:"optimize-multi-agent-v2" json:"optimize-multi-agent-v2"`
 	// LiveMediaRelay terminates and relays Codex Live WebRTC media in this process.
 	LiveMediaRelay CodexLiveMediaRelayConfig `yaml:"live-media-relay" json:"live-media-relay"`
+	// Quota controls Codex quota collection.
+	Quota CodexQuotaConfig `yaml:"quota,omitempty" json:"quota"`
+	// Overdraft controls Codex overdraft pool scheduling.
+	Overdraft CodexOverdraftConfig `yaml:"overdraft,omitempty" json:"overdraft"`
 }
 
 // CodexLiveMediaRelayConfig configures the in-process Codex Live WebRTC gateway.

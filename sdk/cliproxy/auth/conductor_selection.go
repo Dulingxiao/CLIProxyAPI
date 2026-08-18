@@ -301,10 +301,16 @@ func (m *Manager) availableAuthsForRouteModelWithPriorityMode(auths []*Auth, pro
 
 	availableByPriority := make(map[int][]*Auth)
 	cooldownCount := 0
+	liveCount := 0
 	var earliest time.Time
+	reasonSet := make(map[string]struct{})
 	for _, candidate := range auths {
 		checkModel := m.selectionModelForAuth(candidate, routeModel)
 		blocked, reason, next := isAuthBlockedForModel(candidate, checkModel, now)
+		if reason == blockReasonDisabled {
+			continue
+		}
+		liveCount++
 		if !blocked {
 			priority := authPriority(candidate)
 			availableByPriority[priority] = append(availableByPriority[priority], candidate)
@@ -312,14 +318,17 @@ func (m *Manager) availableAuthsForRouteModelWithPriorityMode(auths []*Auth, pro
 		}
 		if reason == blockReasonCooldown {
 			cooldownCount++
-			if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
-				earliest = next
-			}
+		}
+		if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
+			earliest = next
+		}
+		for _, observedReason := range authBlockingReasons(candidate, checkModel, now) {
+			reasonSet[observedReason] = struct{}{}
 		}
 	}
 
 	if len(availableByPriority) == 0 {
-		if cooldownCount == len(auths) && !earliest.IsZero() {
+		if liveCount > 0 && cooldownCount == liveCount && !earliest.IsZero() {
 			providerForError := provider
 			if providerForError == "mixed" {
 				providerForError = ""
@@ -330,10 +339,94 @@ func (m *Manager) availableAuthsForRouteModelWithPriorityMode(auths []*Auth, pro
 			}
 			return nil, newModelCooldownError(routeModel, providerForError, resetIn)
 		}
-		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
+		reasons := sortedStringSetLocal(reasonSet)
+		message := "no auth available"
+		if len(reasons) > 0 {
+			message += " (reason=" + strings.Join(reasons, ",")
+			if !earliest.IsZero() {
+				retryAfter := earliest.Sub(now)
+				if retryAfter < 0 {
+					retryAfter = 0
+				}
+				message += ", retry_after=" + retryAfter.Round(time.Second).String()
+			}
+			message += ")"
+		}
+		return nil, &Error{Code: "auth_unavailable", Message: message, Retryable: !earliest.IsZero(), HTTPStatus: http.StatusServiceUnavailable}
 	}
 
 	return availableAuthsFromPriorityBuckets(availableByPriority, allPriorities), nil
+}
+
+func authBlockingReasons(auth *Auth, model string, now time.Time) []string {
+	if auth == nil {
+		return []string{"unavailable"}
+	}
+	reasons := make(map[string]struct{})
+	addState := func(unavailable bool, quota QuotaState, nextRetry time.Time, lastErr *Error, statusMessage string) {
+		blocked, reason, _ := availabilityBlock(unavailable, quota.Exceeded, nextRetry, quota.NextRecoverAt, now)
+		if !blocked {
+			return
+		}
+		value := ""
+		if lastErr != nil {
+			value = sanitizeAvailabilityReason(lastErr.Code)
+			if value == "" {
+				switch lastErr.StatusCode() {
+				case http.StatusUnauthorized:
+					value = "unauthorized"
+				case http.StatusTooManyRequests:
+					value = "rate_limited"
+				}
+			}
+		}
+		if value == "" && reason == blockReasonCooldown {
+			value = "quota_cooldown"
+		}
+		if value == "" {
+			value = sanitizeAvailabilityReason(statusMessage)
+		}
+		if value == "" {
+			value = "unavailable"
+		}
+		reasons[value] = struct{}{}
+	}
+	modelKey := canonicalModelKey(model)
+	matched := false
+	for stateModel, state := range auth.ModelStates {
+		if state == nil || canonicalModelKey(stateModel) != modelKey {
+			continue
+		}
+		matched = true
+		addState(state.Unavailable, state.Quota, state.NextRetryAfter, state.LastError, state.StatusMessage)
+	}
+	if !matched {
+		addState(auth.Unavailable, auth.Quota, auth.NextRetryAfter, auth.LastError, auth.StatusMessage)
+	}
+	return sortedStringSetLocal(reasons)
+}
+
+func sanitizeAvailabilityReason(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" || len(value) > 64 {
+		return ""
+	}
+	for _, character := range value {
+		if character >= 'a' && character <= 'z' || character >= '0' && character <= '9' || character == '_' || character == '-' || character == '.' {
+			continue
+		}
+		return ""
+	}
+	return value
+}
+
+func sortedStringSetLocal(values map[string]struct{}) []string {
+	result := make([]string, 0, len(values))
+	for value := range values {
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
 }
 
 // availableAuthsForSelector reports the candidates handed to priority-scoped consumers such as
@@ -1404,6 +1497,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 }
 
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
+	m.excludeCodexOverdraftOverlay(tried)
 	if m.HomeEnabled() {
 		return m.pickNextViaHome(ctx, model, opts, tried)
 	}

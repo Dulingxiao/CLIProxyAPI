@@ -1799,3 +1799,30 @@ func TestManager_SchedulerTracksMarkResultCooldownAndRecovery(t *testing.T) {
 		t.Fatalf("len(seen) = %d, want %d", len(seen), 2)
 	}
 }
+
+func TestModelSchedulerUnavailableErrorIgnoresDisabledLeftovers(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	retryAt := now.Add(2 * time.Minute)
+	shard := &modelScheduler{
+		modelKey: "gpt-5.5",
+		entries: map[string]*scheduledAuth{
+			"cool": {
+				auth:        &Auth{ID: "cool", Provider: "codex"},
+				state:       scheduledStateCooldown,
+				nextRetryAt: retryAt,
+			},
+			"off": {
+				auth:  &Auth{ID: "off", Provider: "codex", Status: StatusDisabled},
+				state: scheduledStateDisabled,
+			},
+		},
+	}
+
+	errUnavailable := shard.unavailableErrorLocked("codex", "gpt-5.5", nil)
+	var cooldownErr *modelCooldownError
+	if !errors.As(errUnavailable, &cooldownErr) {
+		t.Fatalf("error = %T %v, want model cooldown", errUnavailable, errUnavailable)
+	}
+}

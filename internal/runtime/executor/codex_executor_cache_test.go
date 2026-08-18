@@ -72,7 +72,7 @@ func TestCodexExecutorCacheHelper_OpenAIChatCompletions_StablePromptCacheKeyFrom
 }
 
 func TestCodexOfficialFingerprintCacheHelperIntegration(t *testing.T) {
-	executor := &CodexExecutor{cfg: &config.Config{}}
+	executor := &CodexExecutor{cfg: &config.Config{Codex: config.CodexConfig{FingerprintMode: "session"}}}
 	auth := &cliproxyauth.Auth{
 		ID:       "oauth-cache-integration",
 		Metadata: map[string]any{"access_token": "oauth-token"},
@@ -110,13 +110,13 @@ func TestCodexOfficialFingerprintCacheHelperIntegration(t *testing.T) {
 		t.Fatal("cacheHelper() body is missing installation identity")
 	}
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
-	if got := httpReq.Header.Get(profile.Headers.WindowID); got != identityState.application.windowID {
-		t.Fatalf("window header = %q, want %q", got, identityState.application.windowID)
+	if got := httpReq.Header.Get(profile.Headers.WindowID); got != "" {
+		t.Fatalf("window header = %q, want omitted by source-derived contract", got)
 	}
 }
 
 func TestCodexOfficialFingerprintCompactCacheHelperIntegration(t *testing.T) {
-	executor := &CodexExecutor{cfg: &config.Config{}}
+	executor := &CodexExecutor{cfg: &config.Config{Codex: config.CodexConfig{FingerprintMode: "session"}}}
 	auth := &cliproxyauth.Auth{
 		ID:       "oauth-compact-integration",
 		Metadata: map[string]any{"access_token": "oauth-token"},
@@ -152,8 +152,8 @@ func TestCodexOfficialFingerprintCompactCacheHelperIntegration(t *testing.T) {
 
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
 	profile := registry.GetCodexFingerprintProfile()
-	if got := httpReq.Header.Get(profile.Headers.InstallationID); got != identityState.application.installationID {
-		t.Fatalf("compact installation header = %q, want %q", got, identityState.application.installationID)
+	if got := httpReq.Header.Get(profile.Headers.InstallationID); got != "" {
+		t.Fatalf("compact installation header = %q, want omitted by source-derived contract", got)
 	}
 	if got := httpReq.Header.Get(profile.Headers.TurnMetadata); got != identityState.application.turnMetadataJSON {
 		t.Fatalf("compact turn metadata header = %q, want %q", got, identityState.application.turnMetadataJSON)

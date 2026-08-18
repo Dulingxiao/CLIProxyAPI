@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"crypto/sha256"
 	stdtls "crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
@@ -17,6 +18,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -24,6 +26,7 @@ import (
 	"time"
 
 	tls "github.com/refraction-networking/utls"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
@@ -469,6 +472,154 @@ func TestNewUtlsHTTPClientUsesContextRoundTripperForProtectedHost(t *testing.T) 
 			}
 		})
 	}
+}
+
+func TestCodexTLSProfileResolutionAndScopedReuse(t *testing.T) {
+	cfg := &config.Config{Codex: config.CodexConfig{TLSProfile: config.CodexTLSProfileSafariLike, TLSReuseConnections: true}}
+	auth := &cliproxyauth.Auth{ID: "auth-a", Attributes: map[string]string{"tls-profile": config.CodexTLSProfileGoStandard}}
+	if got := CodexTLSProfileForAuth(cfg, auth); got != config.CodexTLSProfileGoStandard {
+		t.Fatalf("CodexTLSProfileForAuth() = %q", got)
+	}
+	auth.Attributes["tls-profile"] = "invalid"
+	if got := CodexTLSProfileForAuth(cfg, auth); got != config.CodexTLSProfileSafariLike {
+		t.Fatalf("invalid auth override fallback = %q", got)
+	}
+	if codexClientHelloID(config.CodexTLSProfileChrome) != tls.HelloChrome_Auto || codexClientHelloID(config.CodexTLSProfileSafariLike) != tls.HelloSafari_Auto {
+		t.Fatal("Codex ClientHello profile mapping changed")
+	}
+
+	first := cachedCodexRoundTripper("", "auth-a", config.CodexTLSProfileGoStandard, true)
+	second := cachedCodexRoundTripper("", "auth-a", config.CodexTLSProfileGoStandard, true)
+	otherAuth := cachedCodexRoundTripper("", "auth-b", config.CodexTLSProfileGoStandard, true)
+	otherProxy := cachedCodexRoundTripper("direct", "auth-a", config.CodexTLSProfileGoStandard, true)
+	if first != second {
+		t.Fatal("same auth/proxy/profile did not reuse transport")
+	}
+	if first == otherAuth || first == otherProxy {
+		t.Fatal("Codex transport crossed auth or proxy scope")
+	}
+}
+
+func TestCodexFingerprintRoundTripperSpeaksNegotiatedHTTP2(t *testing.T) {
+	t.Parallel()
+
+	for _, profile := range []string{config.CodexTLSProfileChrome, config.CodexTLSProfileSafariLike} {
+		t.Run(profile, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				if request.ProtoMajor != 2 {
+					http.Error(writer, "server expected HTTP/2, got "+request.Proto, http.StatusHTTPVersionNotSupported)
+					return
+				}
+				writer.Header().Set("Content-Type", "application/json")
+				_, _ = writer.Write([]byte(`{"ok":true}`))
+			}))
+			server.EnableHTTP2 = true
+			server.TLS = &stdtls.Config{NextProtos: []string{"h2", "http/1.1"}}
+			server.StartTLS()
+			t.Cleanup(server.Close)
+
+			client := &http.Client{
+				Transport: newCodexRoundTripperWithTLS("", profile, true, &tls.Config{InsecureSkipVerify: true}),
+				Timeout:   5 * time.Second,
+			}
+			resp, errDo := client.Get(server.URL + "/backend-api/codex/responses")
+			if errDo != nil {
+				t.Fatalf("%s fingerprint request failed: %v", profile, errDo)
+			}
+			defer func() {
+				if errClose := resp.Body.Close(); errClose != nil {
+					t.Errorf("close response body: %v", errClose)
+				}
+			}()
+			body, errRead := io.ReadAll(resp.Body)
+			if errRead != nil {
+				t.Fatalf("read response: %v", errRead)
+			}
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+			}
+			if resp.ProtoMajor != 2 {
+				t.Fatalf("client proto = %s, want HTTP/2.0", resp.Proto)
+			}
+			if string(body) != `{"ok":true}` {
+				t.Fatalf("body = %q", body)
+			}
+		})
+	}
+}
+
+func TestCodexTLSProfileClientHelloGolden(t *testing.T) {
+	want := map[string]string{
+		config.CodexTLSProfileChrome:     "1c58bbe4e3f8c4a8e07c016d46f63e82343034194f2dddcdef74d7ba5b72ec08",
+		config.CodexTLSProfileSafariLike: "76e2cca7ae068b71927ca60a53e416a42055c976f7b5a4ef2c84455a474a418c",
+		config.CodexTLSProfileGoStandard: "6b9f42ef61f0e80ce8de6c6daf4db13e48cc183710e8e8c9e5c26d16c07ab956",
+	}
+	for profile, wantContract := range want {
+		t.Run(profile, func(t *testing.T) {
+			contract := codexClientHelloContract(t, profile)
+			got := fmt.Sprintf("%x", sha256.Sum256([]byte(contract)))
+			if got != wantContract {
+				t.Fatalf("ClientHello contract SHA-256 = %q, want %q", got, wantContract)
+			}
+		})
+	}
+}
+
+func codexClientHelloContract(t *testing.T, profile string) string {
+	t.Helper()
+	if profile == config.CodexTLSProfileGoStandard {
+		return "crypto/tls|min=TLS1.2|alpn=h2,http/1.1|force-h2=true"
+	}
+	spec, errSpec := tls.UTLSIdToSpec(codexClientHelloID(profile))
+	if errSpec != nil {
+		t.Fatal(errSpec)
+	}
+	parts := []string{fmt.Sprintf("vers=%d-%d", spec.TLSVersMin, spec.TLSVersMax)}
+	ciphers := make([]string, 0, len(spec.CipherSuites))
+	for _, cipher := range spec.CipherSuites {
+		if cipher&0x0f0f == 0x0a0a {
+			cipher = 0x0a0a
+		}
+		ciphers = append(ciphers, strconv.Itoa(int(cipher)))
+	}
+	parts = append(parts, "ciphers="+strings.Join(ciphers, ","))
+	extensionParts := make([]string, 0, len(spec.Extensions))
+	for _, extension := range spec.Extensions {
+		name := reflect.TypeOf(extension).String()
+		switch typed := extension.(type) {
+		case *tls.ALPNExtension:
+			name += "(" + strings.Join(typed.AlpnProtocols, ",") + ")"
+		case *tls.SupportedCurvesExtension:
+			values := make([]string, 0, len(typed.Curves))
+			for _, curve := range typed.Curves {
+				value := uint16(curve)
+				if value&0x0f0f == 0x0a0a {
+					value = 0x0a0a
+				}
+				values = append(values, strconv.Itoa(int(value)))
+			}
+			name += "(" + strings.Join(values, ",") + ")"
+		case *tls.SupportedVersionsExtension:
+			values := make([]string, 0, len(typed.Versions))
+			for _, version := range typed.Versions {
+				if version&0x0f0f == 0x0a0a {
+					version = 0x0a0a
+				}
+				values = append(values, strconv.Itoa(int(version)))
+			}
+			name += "(" + strings.Join(values, ",") + ")"
+		}
+		extensionParts = append(extensionParts, name)
+	}
+	if profile == config.CodexTLSProfileChrome {
+		// Chrome deliberately shuffles extension order per connection. The
+		// golden records that behavior while pinning the emitted set.
+		sort.Strings(extensionParts)
+		parts = append(parts, "extension-order=shuffled")
+	}
+	parts = append(parts, extensionParts...)
+	return strings.Join(parts, "|")
 }
 
 type claudeCodeClientHelloSummary struct {

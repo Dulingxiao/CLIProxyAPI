@@ -2,6 +2,7 @@ package usage
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -52,7 +53,16 @@ type Record struct {
 	Fail        Failure
 	Detail      Detail
 	// ResponseHeaders stores a snapshot of upstream response headers for usage sinks.
-	ResponseHeaders http.Header
+	ResponseHeaders   http.Header
+	RequestID         string
+	UpstreamAttemptID string
+	DrainMode         string
+	DrainCycleID      string
+	DrainRequestKind  string
+	ConsumptionClass  string
+	UsagePart         string
+	FailureClass      string
+	UsageReported     bool
 }
 
 // Failure holds HTTP failure metadata for an upstream request attempt.
@@ -78,6 +88,41 @@ type requestedModelAliasContextKey struct{}
 type reasoningEffortContextKey struct{}
 type serviceTierContextKey struct{}
 type generateContextKey struct{}
+type accountingMetadataContextKey struct{}
+
+// AccountingMetadata carries immutable attempt metadata into usage sinks.
+type AccountingMetadata struct {
+	RequestID         string
+	UpstreamAttemptID string
+	CurrentAttemptID  func() string
+	DrainMode         string
+	DrainCycleID      string
+	DrainRequestKind  string
+	ConsumptionClass  string
+	FailureClass      string
+}
+
+// WithAccountingMetadata adds attempt metadata for built-in accounting.
+func WithAccountingMetadata(ctx context.Context, metadata AccountingMetadata) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, accountingMetadataContextKey{}, metadata)
+}
+
+// AccountingMetadataFromContext returns immutable attempt metadata.
+func AccountingMetadataFromContext(ctx context.Context) AccountingMetadata {
+	if ctx == nil {
+		return AccountingMetadata{}
+	}
+	metadata, _ := ctx.Value(accountingMetadataContextKey{}).(AccountingMetadata)
+	if metadata.CurrentAttemptID != nil {
+		if current := strings.TrimSpace(metadata.CurrentAttemptID()); current != "" {
+			metadata.UpstreamAttemptID = current
+		}
+	}
+	return metadata
+}
 
 // WithRequestedModelAlias stores the client-requested model name for usage sinks.
 func WithRequestedModelAlias(ctx context.Context, alias string) context.Context {
@@ -214,6 +259,12 @@ type Plugin interface {
 	HandleUsage(ctx context.Context, record Record)
 }
 
+// DurablePlugin reports whether the built-in sink committed a usage record.
+type DurablePlugin interface {
+	Plugin
+	HandleUsageDurable(ctx context.Context, record Record) error
+}
+
 type queueItem struct {
 	ctx    context.Context
 	record Record
@@ -224,6 +275,7 @@ type Manager struct {
 	once     sync.Once
 	stopOnce sync.Once
 	cancel   context.CancelFunc
+	done     chan struct{}
 
 	mu     sync.Mutex
 	cond   *sync.Cond
@@ -233,11 +285,13 @@ type Manager struct {
 	pluginsMu sync.RWMutex
 	plugins   []Plugin
 	named     map[string]int
+	builtinMu sync.RWMutex
+	builtin   Plugin
 }
 
 // NewManager constructs a manager with a buffered queue.
 func NewManager(buffer int) *Manager {
-	m := &Manager{}
+	m := &Manager{done: make(chan struct{})}
 	m.cond = sync.NewCond(&m.mu)
 	return m
 }
@@ -262,6 +316,7 @@ func (m *Manager) Stop() {
 	if m == nil {
 		return
 	}
+	m.Start(context.Background())
 	m.stopOnce.Do(func() {
 		if m.cancel != nil {
 			m.cancel()
@@ -271,6 +326,7 @@ func (m *Manager) Stop() {
 		m.mu.Unlock()
 		m.cond.Broadcast()
 	})
+	<-m.done
 }
 
 // Register appends a plugin to the delivery list.
@@ -281,6 +337,16 @@ func (m *Manager) Register(plugin Plugin) {
 	m.pluginsMu.Lock()
 	m.plugins = append(m.plugins, plugin)
 	m.pluginsMu.Unlock()
+}
+
+// SetBuiltinSink installs the internal accounting sink independently of external plugins.
+func (m *Manager) SetBuiltinSink(plugin Plugin) {
+	if m == nil {
+		return
+	}
+	m.builtinMu.Lock()
+	m.builtin = plugin
+	m.builtinMu.Unlock()
 }
 
 // RegisterNamed registers or replaces a plugin by name.
@@ -309,23 +375,32 @@ func (m *Manager) RegisterNamed(name string, plugin Plugin) {
 
 // Publish enqueues a usage record for processing. If no plugin is registered
 // the record will be discarded downstream.
-func (m *Manager) Publish(ctx context.Context, record Record) {
+func (m *Manager) Publish(ctx context.Context, record Record) error {
 	if m == nil {
-		return
+		return nil
+	}
+	m.builtinMu.RLock()
+	builtin := m.builtin
+	m.builtinMu.RUnlock()
+	var builtinErr error
+	if builtin != nil {
+		builtinErr = invokeBuiltin(builtin, ctx, record)
 	}
 	// ensure worker is running even if Start was not called explicitly
 	m.Start(context.Background())
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
-		return
+		return builtinErr
 	}
 	m.queue = append(m.queue, queueItem{ctx: ctx, record: record})
 	m.mu.Unlock()
 	m.cond.Signal()
+	return builtinErr
 }
 
 func (m *Manager) run(ctx context.Context) {
+	defer close(m.done)
 	for {
 		m.mu.Lock()
 		for !m.closed && len(m.queue) == 0 {
@@ -367,6 +442,20 @@ func safeInvoke(plugin Plugin, ctx context.Context, record Record) {
 	plugin.HandleUsage(ctx, record)
 }
 
+func invokeBuiltin(plugin Plugin, ctx context.Context, record Record) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("usage: built-in sink panic: %v", recovered)
+			log.Error(err)
+		}
+	}()
+	if durable, ok := plugin.(DurablePlugin); ok {
+		return durable.HandleUsageDurable(ctx, record)
+	}
+	plugin.HandleUsage(ctx, record)
+	return nil
+}
+
 var defaultManager = NewManager(512)
 
 // DefaultManager returns the global usage manager instance.
@@ -379,7 +468,9 @@ func RegisterPlugin(plugin Plugin) { DefaultManager().Register(plugin) }
 func RegisterNamedPlugin(name string, plugin Plugin) { DefaultManager().RegisterNamed(name, plugin) }
 
 // PublishRecord publishes a record using the default manager.
-func PublishRecord(ctx context.Context, record Record) { DefaultManager().Publish(ctx, record) }
+func PublishRecord(ctx context.Context, record Record) error {
+	return DefaultManager().Publish(ctx, record)
+}
 
 // StartDefault starts the default manager's dispatcher.
 func StartDefault(ctx context.Context) { DefaultManager().Start(ctx) }

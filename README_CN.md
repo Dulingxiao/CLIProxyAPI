@@ -138,9 +138,76 @@ CLIProxyAPI 用户手册： [https://help.router-for.me/](https://help.router-fo
 
 请参见 [MANAGEMENT_API_CN.md](https://help.router-for.me/cn/management/api)
 
+## Codex 额度、超刷池与内建计费
+
+官方 Codex 文件型 OAuth 凭据可启用内建额度观测、可选 FIFO 超刷池和按 Auth 持久化的计费流水。本功能统一使用 auth 文件 ID（`auth_id`）作为主键。
+
+完整配置、启用顺序、管理 API 示例与排障流程见 [`CODEX_ANTI_BAN_USAGE_CN.md`](CODEX_ANTI_BAN_USAGE_CN.md)。
+
+```yaml
+codex:
+  fingerprint-mode: off # off | device | session | full
+  tls-profile: chrome # chrome | safari-like | go-standard
+  tls-reuse-connections: true # 按 (Auth, proxy) 隔离
+  quota:
+    enabled: true
+    stale-after: 10m
+    near-threshold-stale-after: 60s
+    min-active-interval: 60s
+    startup-jitter: 30s
+    active-query-concurrency: 8
+  overdraft:
+    enabled: false
+    quota-threshold-percent: "98"
+    arm-threshold-percent: "90"
+    max-in-flight: 40
+    per-auth-max-in-flight: 0 # 0 表示沿用全局上限
+    late-admission-bypass-cooldown: true
+    late-admission-max-attempts: 3
+    allow-credit-spend: false
+    exhaustion-probe-failures: 10
+    probe-min-interval: 1s
+    probe-model: "gpt-5.3-codex"
+
+accounting:
+  enabled: false
+  storage-path: "AUTH_STATE_DIR/accounting.db"
+```
+
+- `/backend-api/wham/usage` 主动查询是额度真值源；允许列表内的响应头仅作机会性补充。临近阈值时自动加速，并严格执行每 Auth 的 `min-active-interval`。
+- 达到阈值后按首次入池时间严格先进先出；同一时间只有一个活动超刷 Auth。`CANDIDATE` 仍走普通轮询，只有 `EXHAUSTED` 和 Overlay `DISABLED` 退出普通选择；兼容请求先拿超刷租约，拿不到再溢出到 `NORMAL`/`CANDIDATE`，不会绕过 `max-in-flight`。`max-in-flight` 是全局 Overlay 上限，`per-auth-max-in-flight` 是独立的 owner 上限，并支持 Auth 属性 `codex_overdraft_max_in_flight` 覆盖。
+- 窗口已满时默认排除付费 credits 消耗；仅 `allow-credit-spend: true` 显式放开，accounting 会标记为 `over_window_on_credits`。
+- 官方 ChatGPT 传输支持 `chrome`、`safari-like`、`go-standard` 三路 A-B；连接与 TLS 会话复用不跨 Auth 或代理。
+- 每次实际超刷上游发送都会在最终 Codex Body 末尾追加相邻的 `zz` 调用和输出；`arguments` 与 `output` 均为字符串 `"{}"`，重试会生成新的 Attempt ID 和 Call ID。
+- 账号成为超刷 owner 后，业务请求连续十次结构化 `usage_limit_reached` 429 进入 `EXHAUSTED`。之后若出现非额度错误或成功请求，计数清零。主动额度查询确认恢复后统一回到 `NORMAL`。
+- 内建计费持久化发送前 Intent、不可变 Usage Part、Attempt 关闭事件、价格版本和费用结果。费用异步计算，并区分上游报告零 Token 与 Usage 缺失。
+- 终态 Usage 采用同步持久化。持久化故障会让已完成的非流式请求返回请求级 `503`，并暂停后续 Codex 准入，等待重启与 reconcile；系统不会把已经完成的上游工作换 Auth 重放。额度库持久化故障只暂停超刷 Overlay，普通调度继续可用；下一次成功持久化的额度观测会用新代次重建 Overlay。
+- `codex.overdraft.enabled: false` 会移除候选、活动超刷、验证和耗尽 Overlay；额度采集与普通请求计费仍可按各自开关独立运行。
+- Codex 应用身份收敛使用独立的显式开关。`off` 保留客户端应用身份；`device` 只收敛安装标识；`session` 进一步收敛账号会话，并根据客户端原始会话派生线程；`full` 还会收敛账号线程。Auth 属性 `codex_fingerprint_mode` 与 `openai_device_id` 可覆盖全局配置。
+- `X-Codex-Turn-State` 作为协议状态始终向下游转发。系统按调用方、客户端会话和不透明状态值记录其来源；换号时剥离已知由其他 Auth 铸造的状态，同 Auth 或来源未知的状态保持透传。
+
+相关管理接口位于 `/v0/management`：`/codex/overdraft/status`、`/codex/overdraft/enabled`、`/codex/quota`、`/codex/quota/health`、`/codex/quota/debug`、`/codex/quota/:auth_id/refresh`、`/codex/upstream-failures`、`/accounting/health`、`/accounting/events`、`/accounting/costs`、`/accounting/aggregate`、`/accounting/aggregates` 和 `/model-pricing`（含 `/reprice`）。Event 与 Cost 分页支持 `auth_id`、`provider`、`model`、`tier`、`drain_cycle_id`、RFC3339 `from`/`to`、`offset` 和 `limit`（最大 500）；Cost 还支持 `cost_status`、`price_version_id` 与 `pricing_run_id`。
+
+模型价格采用带生效时间的不可变版本。五个 `*_nano_usd_per_million` 字段表示每一百万 Token 的 nano-USD 价格（`1 USD = 1,000,000,000 nano-USD`）：
+
+```json
+{
+  "model": "gpt-5.3-codex",
+  "tier": "default",
+  "effective_from": "2026-08-16T00:00:00Z",
+  "input_nano_usd_per_million": 1250000000,
+  "cache_read_nano_usd_per_million": 125000000,
+  "cache_write_nano_usd_per_million": 0,
+  "output_nano_usd_per_million": 10000000000,
+  "reasoning_nano_usd_per_million": 10000000000
+}
+```
+
+通过 `PUT /v0/management/model-pricing` 新建价格版本，通过同路径的 `GET` 查询版本，并通过 `POST /v0/management/model-pricing/reprice` 重建历史不可变费用结果。
+
 ## 使用量统计
 
-自v6.10.0版本以后，CLIProxyAPI及 [CPAMC](https://github.com/router-for-me/Cli-Proxy-API-Management-Center) 项目不再预置数据统计功能，如果有数据统计需求的请使用以下项目：
+上面的可选 Accounting 流水为 Codex Auth 池提供请求、Token 和费用数据。CLIProxyAPI 及 [CPAMC](https://github.com/router-for-me/Cli-Proxy-API-Management-Center) 仍未内置通用统计看板；如需更广泛的可视化能力，可使用以下项目：
 
 ### [CPA Usage Keeper](https://github.com/Willxup/cpa-usage-keeper)
 

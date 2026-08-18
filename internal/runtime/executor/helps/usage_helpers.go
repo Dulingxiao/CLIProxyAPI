@@ -3,6 +3,7 @@ package helps
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -22,6 +23,7 @@ import (
 )
 
 type UsageReporter struct {
+	context         context.Context
 	provider        string
 	executorType    string
 	model           string
@@ -36,12 +38,15 @@ type UsageReporter struct {
 	reasoning       string
 	serviceTier     string
 	generate        bool
+	usageReported   bool
+	failureClass    string
 	requestedAt     time.Time
 	ttftMu          sync.RWMutex
 	ttft            time.Duration
 	ttftStart       time.Time
 	ttftSet         bool
 	once            sync.Once
+	publishErr      error
 }
 
 type usageExecutor interface {
@@ -65,6 +70,7 @@ func NewUsageReporter(ctx context.Context, provider, model string, auth *cliprox
 		alias = model
 	}
 	reporter := &UsageReporter{
+		context:     ctx,
 		provider:    provider,
 		model:       model,
 		alias:       strings.TrimSpace(alias),
@@ -114,16 +120,19 @@ func ExecutorTypeName(executor any) string {
 	return strings.TrimSpace(executorType.Name())
 }
 
-func (r *UsageReporter) Publish(ctx context.Context, detail usage.Detail) {
-	r.publishWithOutcome(ctx, detail, false, usage.Failure{})
+func (r *UsageReporter) Publish(ctx context.Context, detail usage.Detail) error {
+	if r != nil {
+		r.usageReported = detail.TokenBreakdown.Valid() || hasNonZeroTokenUsage(detail)
+	}
+	return r.publishWithOutcome(ctx, detail, false, usage.Failure{})
 }
 
-func (r *UsageReporter) PublishAdditionalModel(ctx context.Context, model string, detail usage.Detail) {
+func (r *UsageReporter) PublishAdditionalModel(ctx context.Context, model string, detail usage.Detail) error {
 	record, ok := r.buildAdditionalModelRecord(model, detail)
 	if !ok {
-		return
+		return nil
 	}
-	r.publishRecord(ctx, record)
+	return r.publishRecord(ctx, record)
 }
 
 func (r *UsageReporter) SetTranslatedReasoningEffort(payload []byte, format string) {
@@ -203,30 +212,43 @@ func (r *UsageReporter) buildAdditionalModelRecord(model string, detail usage.De
 	if !hasNonZeroTokenUsage(detail) {
 		return usage.Record{}, false
 	}
-	return r.buildRecordForModel(model, detail, false, usage.Failure{}), true
+	record := r.buildRecordForModel(model, detail, false, usage.Failure{})
+	record.UsagePart = "model:" + model
+	return record, true
 }
 
-func (r *UsageReporter) PublishFailure(ctx context.Context, errs ...error) {
-	r.publishWithOutcome(ctx, usage.Detail{}, true, failFromErrors(errs...))
+func (r *UsageReporter) PublishFailure(ctx context.Context, errs ...error) error {
+	if r != nil {
+		for _, errValue := range errs {
+			var notDispatched interface{ NotDispatched() bool }
+			if errors.As(errValue, &notDispatched) && notDispatched.NotDispatched() {
+				r.failureClass = "not_dispatched"
+				break
+			}
+		}
+	}
+	return r.publishWithOutcome(ctx, usage.Detail{}, true, failFromErrors(errs...))
 }
 
-func (r *UsageReporter) TrackFailure(ctx context.Context, errPtr *error) {
+func (r *UsageReporter) TrackFailure(ctx context.Context, errPtr *error) error {
 	if r == nil || errPtr == nil {
-		return
+		return nil
 	}
 	if *errPtr != nil {
-		r.PublishFailure(ctx, *errPtr)
+		return r.PublishFailure(ctx, *errPtr)
 	}
+	return nil
 }
 
-func (r *UsageReporter) publishWithOutcome(ctx context.Context, detail usage.Detail, failed bool, fail usage.Failure) {
+func (r *UsageReporter) publishWithOutcome(ctx context.Context, detail usage.Detail, failed bool, fail usage.Failure) error {
 	if r == nil {
-		return
+		return nil
 	}
 	detail = normalizeUsageDetailTotal(detail, r.provider, r.executorType)
 	r.once.Do(func() {
-		r.publishRecord(ctx, r.buildRecord(detail, failed, fail))
+		r.publishErr = r.publishRecord(ctx, r.buildRecord(detail, failed, fail))
 	})
+	return r.publishErr
 }
 
 func normalizeUsageDetailTotal(detail usage.Detail, provider, executorType string) usage.Detail {
@@ -248,18 +270,19 @@ func hasNonZeroTokenUsage(detail usage.Detail) bool {
 // It is safe to call multiple times; only the first call wins due to once.Do.
 // This is used to ensure request counting even when upstream responses do not
 // include any usage fields (tokens), especially for streaming paths.
-func (r *UsageReporter) EnsurePublished(ctx context.Context) {
+func (r *UsageReporter) EnsurePublished(ctx context.Context) error {
 	if r == nil {
-		return
+		return nil
 	}
 	r.once.Do(func() {
-		r.publishRecord(ctx, r.buildRecord(usage.Detail{}, false, usage.Failure{}))
+		r.publishErr = r.publishRecord(ctx, r.buildRecord(usage.Detail{}, false, usage.Failure{}))
 	})
+	return r.publishErr
 }
 
-func (r *UsageReporter) publishRecord(ctx context.Context, record usage.Record) {
+func (r *UsageReporter) publishRecord(ctx context.Context, record usage.Record) error {
 	record.ResponseHeaders = internallogging.GetResponseHeaders(ctx)
-	usage.PublishRecord(ctx, record)
+	return usage.PublishRecord(ctx, record)
 }
 
 func (r *UsageReporter) buildRecord(detail usage.Detail, failed bool, failures ...usage.Failure) usage.Record {
@@ -276,6 +299,11 @@ func (r *UsageReporter) buildRecord(detail usage.Detail, failed bool, failures .
 func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, failed bool, fail usage.Failure) usage.Record {
 	if r == nil {
 		return usage.Record{Model: model, Detail: detail, Failed: failed, Fail: fail, Generate: usage.GenerateFlag(true)}
+	}
+	metadata := usage.AccountingMetadataFromContext(r.context)
+	failureClass := metadata.FailureClass
+	if r.failureClass != "" {
+		failureClass = r.failureClass
 	}
 	return usage.Record{
 		Provider:            r.provider,
@@ -298,6 +326,15 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 		Failed:              failed,
 		Fail:                fail,
 		Detail:              detail,
+		RequestID:           metadata.RequestID,
+		UpstreamAttemptID:   metadata.UpstreamAttemptID,
+		DrainMode:           metadata.DrainMode,
+		DrainCycleID:        metadata.DrainCycleID,
+		DrainRequestKind:    metadata.DrainRequestKind,
+		ConsumptionClass:    metadata.ConsumptionClass,
+		UsagePart:           "primary",
+		FailureClass:        failureClass,
+		UsageReported:       r.usageReported || hasNonZeroTokenUsage(detail),
 	}
 }
 
@@ -518,11 +555,16 @@ func (b *StreamUsageBuffer) ObserveOpenAIStream(line []byte) {
 
 // Publish emits the latest observed usage detail, if any.
 func (b *StreamUsageBuffer) Publish(ctx context.Context, reporter *UsageReporter) bool {
+	published, _ := b.PublishDurable(ctx, reporter)
+	return published
+}
+
+// PublishDurable emits the latest usage detail and reports built-in sink failures.
+func (b *StreamUsageBuffer) PublishDurable(ctx context.Context, reporter *UsageReporter) (bool, error) {
 	if b == nil || !b.ok || reporter == nil {
-		return false
+		return false, nil
 	}
-	reporter.Publish(ctx, b.detail)
-	return true
+	return true, reporter.Publish(ctx, b.detail)
 }
 
 // Detail returns the latest observed usage detail.
