@@ -383,6 +383,18 @@ func (m *Manager) acquireCodexOverdraftExecution(providers []string, req cliprox
 			tried[owner] = struct{}{}
 		}
 	}
+	// Rejections that mean the owner cannot serve at all must count toward
+	// retirement, otherwise an owner blocked before dispatch keeps the drain
+	// slot forever. Capacity denials are excluded: a saturated owner is healthy.
+	rejectUnservableOwner := func(reason string) {
+		logCodexOverdraftRejection(reason, owner, req.Model)
+		if retired, errBlocked := coordinator.RecordAdmissionBlocked(owner); errBlocked != nil {
+			logEntryWithRequestID(nil).WithField("auth_id", owner).Warnf("failed to record Codex overdraft admission block: %v", errBlocked)
+		} else if retired {
+			logEntryWithRequestID(nil).WithField("auth_id", owner).WithField("reason", reason).Warn("retired stalled Codex overdraft owner after repeated unservable admissions")
+		}
+		rejectOwner()
+	}
 	m.mu.RLock()
 	auth := m.auths[owner]
 	if auth != nil {
@@ -390,8 +402,7 @@ func (m *Manager) acquireCodexOverdraftExecution(providers []string, req cliprox
 	}
 	m.mu.RUnlock()
 	if !isCodexOverdraftEligibleAuth(auth) || auth.Disabled || auth.Status == StatusDisabled {
-		logCodexOverdraftRejection("owner_auth_ineligible", owner, req.Model)
-		rejectOwner()
+		rejectUnservableOwner("owner_auth_ineligible")
 		return nil, nil, false
 	}
 	blocked, blockedReason, _ := isAuthBlockedForModel(auth, req.Model, time.Now())
@@ -400,8 +411,7 @@ func (m *Manager) acquireCodexOverdraftExecution(providers []string, req cliprox
 	if blocked {
 		lateAdmission, lateAdmissionMaxAttempts = m.canBypassLateCodexUsageLimitCooldown(auth, req.Model, coordinator)
 		if !lateAdmission {
-			logCodexOverdraftRejection(fmt.Sprintf("owner_blocked_reason_%d_no_late_admission", blockedReason), owner, req.Model)
-			rejectOwner()
+			rejectUnservableOwner(fmt.Sprintf("owner_blocked_reason_%d_no_late_admission", blockedReason))
 			return nil, nil, false
 		}
 	}
@@ -413,20 +423,14 @@ func (m *Manager) acquireCodexOverdraftExecution(providers []string, req cliprox
 		lease, errAcquire = coordinator.AcquireBusiness(dispatchIDFromOptions(opts))
 	}
 	if errAcquire != nil {
-		if lateAdmission && errors.Is(errAcquire, codexoverdraft.ErrLateAdmissionExhausted) {
-			// The owner spent its late-admission budget while still blocked and
-			// can no longer admit traffic, yet it will never accumulate enough
-			// usage-limit results to exhaust on its own. Retire it so a fresh
-			// candidate can take over instead of stalling the pool.
-			if retired, errRetire := coordinator.RetireStalledLateOwner(owner, lateAdmissionMaxAttempts); errRetire != nil {
-				logEntryWithRequestID(nil).WithField("auth_id", owner).Warnf("failed to retire stalled Codex overdraft owner: %v", errRetire)
-			} else if retired {
-				logCodexOverdraftRejection("late_admission_exhausted_owner_retired", owner, req.Model)
-			}
-		} else {
+		if errors.Is(errAcquire, codexoverdraft.ErrCapacity) {
+			// A saturated owner is healthy: overflow belongs on the ordinary pool
+			// and must not count against the owner.
 			logCodexOverdraftRejection("lease_denied: "+errAcquire.Error(), owner, req.Model)
+			rejectOwner()
+		} else {
+			rejectUnservableOwner("lease_denied: " + errAcquire.Error())
 		}
-		rejectOwner()
 		return nil, nil, false
 	}
 	var (

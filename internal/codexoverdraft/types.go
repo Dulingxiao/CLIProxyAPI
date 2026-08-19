@@ -104,6 +104,7 @@ type Record struct {
 	EnteredAlreadyFull    bool      `json:"entered_already_full,omitempty"`
 	LateAdmissionAttempts int       `json:"late_admission_attempts,omitempty"`
 	ProbeFailures         int       `json:"probe_failures,omitempty"`
+	AdmissionBlocks       int       `json:"admission_blocks,omitempty"`
 	ExhaustedAt           time.Time `json:"exhausted_at,omitempty"`
 	Disabled              bool      `json:"disabled,omitempty"`
 	InheritedInFlight     int       `json:"inherited_in_flight,omitempty"`

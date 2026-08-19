@@ -323,16 +323,16 @@ func (c *Coordinator) AcquireLateBusiness(dispatchID string, maxAttempts int) (*
 	return lease, nil
 }
 
-// RetireStalledLateOwner exhausts an ACTIVE_DRAIN owner that spent its full
-// late-admission budget entirely on usage-limit failures while its cooldown
-// never cleared. Without this the owner cannot admit traffic (late budget spent)
-// yet never reaches the consecutive usage-limit count that marks it EXHAUSTED,
-// so the pool stalls with a permanently idle owner. A budget spent on
-// non-failing sends (ProbeFailures below the budget) means the owner is still
-// serving, so it is left in place. Retiring a truly stalled owner lets the next
-// candidate take over.
-func (c *Coordinator) RetireStalledLateOwner(authID string, maxAttempts int) (bool, error) {
-	if authID == "" || maxAttempts <= 0 {
+// RecordAdmissionBlocked counts one request that the drain owner could not admit
+// for a reason that leaves it unable to serve at all (auth-level block, no
+// eligible late admission, spent late-admission budget). Exhaustion is otherwise
+// only reached by counting usage-limit results from requests that actually
+// reached upstream, so an owner blocked before dispatch would keep the drain slot
+// forever while every request falls back to the ordinary pool. Reaching the same
+// count as the usage-limit threshold retires the owner and promotes the next
+// candidate. Any successful admission resets the streak.
+func (c *Coordinator) RecordAdmissionBlocked(authID string) (bool, error) {
+	if authID == "" {
 		return false, nil
 	}
 	c.mu.Lock()
@@ -341,8 +341,13 @@ func (c *Coordinator) RetireStalledLateOwner(authID string, maxAttempts int) (bo
 		return false, nil
 	}
 	record, ok := c.state.Records[authID]
-	if !ok || record.State != StateActiveDrain || record.Disabled || record.CalibrationRequired || record.LateAdmissionAttempts < maxAttempts || record.ProbeFailures < maxAttempts {
+	if !ok || record.State != StateActiveDrain || record.Disabled || record.CalibrationRequired {
 		return false, nil
+	}
+	record.AdmissionBlocks++
+	if record.AdmissionBlocks < c.config.ExhaustionProbeFailures {
+		c.state.Records[authID] = record
+		return false, c.persistLocked()
 	}
 	record.State = StateExhausted
 	record.StateEpoch++
@@ -397,6 +402,7 @@ func (c *Coordinator) acquireLocked(record Record, dispatchID string, kind Lease
 	c.perAuthInFlight[record.AuthID]++
 	if kind == LeaseBusiness {
 		record.BusinessAttempts++
+		record.AdmissionBlocks = 0
 		c.state.Records[record.AuthID] = record
 	}
 	return lease, nil
@@ -837,6 +843,7 @@ func clearRecordCycle(record *Record) {
 	record.EnteredAlreadyFull = false
 	record.LateAdmissionAttempts = 0
 	record.ProbeFailures = 0
+	record.AdmissionBlocks = 0
 	record.ExhaustedAt = time.Time{}
 	record.VerificationPaused = false
 	record.VerificationPauseCode = ""

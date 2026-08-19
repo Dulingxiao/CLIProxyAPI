@@ -206,7 +206,7 @@ func TestCoordinatorLeaseFenceLimitAndSwitch(t *testing.T) {
 	}
 }
 
-func TestCoordinatorRetireStalledLateOwnerPromotesNextCandidate(t *testing.T) {
+func TestCoordinatorAdmissionBlocksRetireOwnerAndPromoteNextCandidate(t *testing.T) {
 	c := enabledCoordinator(t, &fakeClock{now: time.Now()}, nil)
 	for _, id := range []string{"owner", "next"} {
 		if errRegister := c.RegisterAuth(id, 1, 0); errRegister != nil {
@@ -219,32 +219,20 @@ func TestCoordinatorRetireStalledLateOwnerPromotesNextCandidate(t *testing.T) {
 		t.Fatalf("owner = %q, want owner", got)
 	}
 
-	// Spend the late-admission budget while the owner stays blocked upstream:
-	// each attempt records a usage-limit 429 but never reaches the exhaustion count.
-	const maxAttempts = 3
-	for i := 0; i < maxAttempts; i++ {
-		lease, errLease := c.AcquireLateBusiness(fmt.Sprintf("late-%d", i), maxAttempts)
-		if errLease != nil {
-			t.Fatalf("AcquireLateBusiness(%d) error = %v", i, errLease)
+	// The owner is blocked before dispatch, so no usage-limit result can ever
+	// arrive to exhaust it. Only the admission-block streak can retire it.
+	for i := 1; i < 10; i++ {
+		retired, errBlocked := c.RecordAdmissionBlocked("owner")
+		if errBlocked != nil || retired {
+			t.Fatalf("RecordAdmissionBlocked(%d) = %t, %v; want false", i, retired, errBlocked)
 		}
-		if errBegin := c.BeginSend(lease); errBegin != nil {
-			t.Fatal(errBegin)
+		if got := c.Record("owner"); got.State != StateActiveDrain || got.AdmissionBlocks != i {
+			t.Fatalf("after %d blocks record = %#v", i, got)
 		}
-		if errLimit := c.BusinessUsageLimit(lease); errLimit != nil {
-			t.Fatal(errLimit)
-		}
-		_ = c.Release(lease)
 	}
-	if _, errLease := c.AcquireLateBusiness("late-final", maxAttempts); !errors.Is(errLease, ErrLateAdmissionExhausted) {
-		t.Fatalf("AcquireLateBusiness after budget error = %v, want ErrLateAdmissionExhausted", errLease)
-	}
-	if got := c.Record("owner"); got.State != StateActiveDrain {
-		t.Fatalf("owner state before retire = %s, want ACTIVE_DRAIN (stalled)", got.State)
-	}
-
-	retired, errRetire := c.RetireStalledLateOwner("owner", maxAttempts)
-	if errRetire != nil || !retired {
-		t.Fatalf("RetireStalledLateOwner() = %t, %v", retired, errRetire)
+	retired, errBlocked := c.RecordAdmissionBlocked("owner")
+	if errBlocked != nil || !retired {
+		t.Fatalf("RecordAdmissionBlocked(threshold) = %t, %v; want true", retired, errBlocked)
 	}
 	if got := c.Record("owner").State; got != StateExhausted {
 		t.Fatalf("owner state after retire = %s, want EXHAUSTED", got)
@@ -254,6 +242,49 @@ func TestCoordinatorRetireStalledLateOwnerPromotesNextCandidate(t *testing.T) {
 	}
 	if got := c.Record("next").State; got != StateActiveDrain {
 		t.Fatalf("next state = %s, want ACTIVE_DRAIN", got)
+	}
+}
+
+func TestCoordinatorSuccessfulAdmissionResetsBlockStreak(t *testing.T) {
+	c := enabledCoordinator(t, &fakeClock{now: time.Now()}, nil)
+	_ = c.RegisterAuth("owner", 1, 0)
+	_ = c.ObserveThreshold("owner", 1, 99_000_000)
+	for i := 0; i < 9; i++ {
+		if retired, errBlocked := c.RecordAdmissionBlocked("owner"); errBlocked != nil || retired {
+			t.Fatalf("RecordAdmissionBlocked(%d) = %t, %v", i, retired, errBlocked)
+		}
+	}
+	lease, errAcquire := c.AcquireBusiness("dispatch-recovered")
+	if errAcquire != nil {
+		t.Fatal(errAcquire)
+	}
+	if got := c.Record("owner").AdmissionBlocks; got != 0 {
+		t.Fatalf("AdmissionBlocks after successful admission = %d, want 0", got)
+	}
+	_ = c.Release(lease)
+	// A transient block streak must not retire an owner that recovered.
+	if retired, errBlocked := c.RecordAdmissionBlocked("owner"); errBlocked != nil || retired {
+		t.Fatalf("RecordAdmissionBlocked after reset = %t, %v; want false", retired, errBlocked)
+	}
+	if got := c.Record("owner").State; got != StateActiveDrain {
+		t.Fatalf("owner state = %s, want ACTIVE_DRAIN", got)
+	}
+}
+
+func TestCoordinatorLateAdmissionBudgetReportsDistinctError(t *testing.T) {
+	c := enabledCoordinator(t, &fakeClock{now: time.Now()}, nil)
+	_ = c.RegisterAuth("owner", 1, 0)
+	_ = c.ObserveThreshold("owner", 1, 99_000_000)
+	const maxAttempts = 3
+	for i := 0; i < maxAttempts; i++ {
+		lease, errLease := c.AcquireLateBusiness(fmt.Sprintf("late-%d", i), maxAttempts)
+		if errLease != nil {
+			t.Fatalf("AcquireLateBusiness(%d) error = %v", i, errLease)
+		}
+		_ = c.Release(lease)
+	}
+	if _, errLease := c.AcquireLateBusiness("late-final", maxAttempts); !errors.Is(errLease, ErrLateAdmissionExhausted) {
+		t.Fatalf("AcquireLateBusiness after budget error = %v, want ErrLateAdmissionExhausted", errLease)
 	}
 }
 

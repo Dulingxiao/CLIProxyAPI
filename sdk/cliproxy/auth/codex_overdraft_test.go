@@ -454,6 +454,87 @@ func TestManagerLateAdmissionAttemptLimit(t *testing.T) {
 	}
 }
 
+func TestManagerBlockedOwnerWithoutLateAdmissionIsRetired(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	cfg := &internalconfig.Config{}
+	cfg.Codex.Overdraft = internalconfig.DefaultCodexOverdraftConfig()
+	m.runtimeConfig.Store(cfg)
+	coordinator := testOverdraftCoordinator(t)
+	m.SetCodexOverdraftCoordinator(coordinator)
+
+	// The owner is unavailable at the auth level with a non usage-limit error, so
+	// late admission never applies and no request can reach upstream to exhaust it.
+	owner := fileCodexAuth("active-blocked-owner")
+	owner.ModelStates = map[string]*ModelState{"gpt-test": {
+		Status: StatusError, Unavailable: true, NextRetryAfter: time.Now().Add(time.Hour),
+		LastError: &Error{Code: "model_cooldown", HTTPStatus: http.StatusTooManyRequests, Retryable: true},
+	}}
+	m.auths[owner.ID] = owner
+	next := fileCodexAuth("waiting-candidate")
+	m.auths[next.ID] = next
+	for _, auth := range []*Auth{owner, next} {
+		if errRegister := coordinator.RegisterAuth(auth.ID, 1, 0); errRegister != nil {
+			t.Fatal(errRegister)
+		}
+		if errObserve := coordinator.ObserveThreshold(auth.ID, 1, 99_000_000); errObserve != nil {
+			t.Fatal(errObserve)
+		}
+	}
+	if got := coordinator.Owner(); got != owner.ID {
+		t.Fatalf("owner = %q, want %q", got, owner.ID)
+	}
+
+	req := cliproxyexecutor.Request{Model: "gpt-test", Payload: []byte(`{"input":[{"role":"user","content":"hello"}]}`)}
+	for i := 0; i < 10; i++ {
+		execution, _, ok := m.acquireCodexOverdraftExecution([]string{"codex"}, req, cliproxyexecutor.Options{}, map[string]struct{}{})
+		if ok || execution != nil {
+			t.Fatalf("attempt %d admitted a blocked owner", i+1)
+		}
+	}
+	if got := coordinator.Record(owner.ID).State; got != codexoverdraft.StateExhausted {
+		t.Fatalf("blocked owner state = %s, want EXHAUSTED", got)
+	}
+	if got := coordinator.Owner(); got != next.ID {
+		t.Fatalf("owner after retire = %q, want %q", got, next.ID)
+	}
+}
+
+func TestManagerCapacityDenialDoesNotRetireHealthyOwner(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	cfg := &internalconfig.Config{}
+	cfg.Codex.Overdraft = internalconfig.DefaultCodexOverdraftConfig()
+	m.runtimeConfig.Store(cfg)
+	coordinator, errNew := codexoverdraft.NewCoordinator(codexoverdraft.CoordinatorConfig{
+		Enabled: true, ThresholdMicropct: 98_000_000, MaxInFlight: 1, ExhaustionProbeFailures: 10,
+	}, nil, nil)
+	if errNew != nil {
+		t.Fatal(errNew)
+	}
+	m.SetCodexOverdraftCoordinator(coordinator)
+	auth := fileCodexAuth("saturated-owner")
+	m.auths[auth.ID] = auth
+	_ = coordinator.RegisterAuth(auth.ID, 1, 0)
+	_ = coordinator.ObserveThreshold(auth.ID, 1, 99_000_000)
+
+	req := cliproxyexecutor.Request{Model: "gpt-test", Payload: []byte(`{"input":[{"role":"user","content":"hello"}]}`)}
+	held, _, ok := m.acquireCodexOverdraftExecution([]string{"codex"}, req, cliproxyexecutor.Options{}, map[string]struct{}{})
+	if !ok || held == nil {
+		t.Fatal("first admission was denied")
+	}
+	defer held.Release()
+	for i := 0; i < 12; i++ {
+		if execution, _, okSaturated := m.acquireCodexOverdraftExecution([]string{"codex"}, req, cliproxyexecutor.Options{}, map[string]struct{}{}); okSaturated || execution != nil {
+			t.Fatalf("attempt %d bypassed the saturated lease ceiling", i+1)
+		}
+	}
+	if got := coordinator.Record(auth.ID).State; got != codexoverdraft.StateActiveDrain {
+		t.Fatalf("saturated owner state = %s, want ACTIVE_DRAIN", got)
+	}
+	if got := coordinator.Owner(); got != auth.ID {
+		t.Fatalf("owner = %q, want %q retained", got, auth.ID)
+	}
+}
+
 func TestManagerCredentialUnauthorizedReleasesOverdraftOwner(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	coordinator := testOverdraftCoordinator(t)
